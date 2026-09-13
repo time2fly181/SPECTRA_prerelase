@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra-sleep-staging"
+version = "0.1.0"
+description = "SPECTRA: EDF sleep staging with a multirate asymmetric CNN and context transformer"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.9.1",
+    "numpy==2.3.3",
+    "scipy==1.16.2",
+    "pyedflib==0.1.42",
+    "mne==1.11.0",
+    "PySide6==6.10.0",
+    "pyqtgraph==0.14.0",
+    "matplotlib==3.10.7",
+    "pandas==2.3.3",
+    "pydantic>=2.11,<3",
+    "PyYAML>=6,<7",
+]
+
+[project.scripts]
+spectra = "spectra.cli:main"
+spectra-gui = "spectra.gui:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.12", "black>=25"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

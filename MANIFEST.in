@@ -1,0 +1,3 @@
+include README.md NOTICE uv.lock inference_gui.py
+recursive-include docs *.md *.json
+recursive-include tests *.py
