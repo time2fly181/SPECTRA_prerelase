@@ -19,9 +19,6 @@ class PreparedContextWaveforms(NamedTuple):
             Values are unchanged.
         cnn_waveform: Finite, presence-masked waveform with shape
             ``[B * L, C, T]``.
-        feature_waveform: Presence-masked physical waveform for engineered
-            feature paths. Explicit ``wave_raw`` input is preserved when present;
-            otherwise this is the finite CNN waveform.
         presence_mask: Actual channel presence with shape ``[B * L, C]``, or
             ``None`` when the caller supplied no mask.
         cnn_presence_mask: CNN-safe channel presence. All-missing rows receive a
@@ -34,7 +31,6 @@ class PreparedContextWaveforms(NamedTuple):
 
     waveform: torch.Tensor
     cnn_waveform: torch.Tensor
-    feature_waveform: torch.Tensor
     presence_mask: torch.Tensor | None
     cnn_presence_mask: torch.Tensor | None
     epoch_valid_mask: torch.Tensor
@@ -68,7 +64,7 @@ class ContextWaveformPreparer(nn.Module):
 
         Args:
             inputs: A ``[B, L, C, T]`` tensor, or a mapping containing ``wave``
-                and optional ``wave_raw``, ``presence_mask`` (legacy ``mask``),
+                and optional ``presence_mask`` (legacy ``mask``),
                 and ``epoch_valid_mask`` tensors.
 
         Returns:
@@ -99,6 +95,8 @@ class ContextWaveformPreparer(nn.Module):
                 "Expected waveform [B, L, C, T], got " f"{tuple(waveform.shape)}"
             )
         batch, epochs, channels, samples = waveform.shape
+        if epochs != 21:
+            raise ValueError("SPECTRA requires context_half=10 (21 context epochs)")
         if batch < 1 or epochs < 1:
             raise ValueError(
                 "Waveform batch and context dimensions must be positive, got "
@@ -165,32 +163,6 @@ class ContextWaveformPreparer(nn.Module):
                 fallback,
             )
 
-        raw_value = mapping.get("wave_raw") if mapping is not None else None
-        if raw_value is None:
-            feature_waveform = cnn_waveform
-        else:
-            if not isinstance(raw_value, torch.Tensor):
-                raise TypeError("Input mapping 'wave_raw' must be a torch.Tensor")
-            if raw_value.shape != waveform.shape:
-                raise ValueError(
-                    "wave_raw must match wave shape "
-                    f"{tuple(waveform.shape)}, got {tuple(raw_value.shape)}"
-                )
-            if raw_value.device != waveform.device:
-                raise ValueError(
-                    "wave_raw must be on the same device as wave, got "
-                    f"{raw_value.device} and {waveform.device}"
-                )
-            feature_waveform = raw_value.contiguous().reshape(
-                flat_rows, channels, samples
-            )
-            if presence_mask is not None:
-                feature_waveform = torch.where(
-                    presence_mask.unsqueeze(-1),
-                    feature_waveform,
-                    torch.zeros((), device=waveform.device, dtype=raw_value.dtype),
-                )
-
         recording_value = (
             mapping.get("recording_index") if mapping is not None else None
         )
@@ -203,7 +175,6 @@ class ContextWaveformPreparer(nn.Module):
         return PreparedContextWaveforms(
             waveform=waveform,
             cnn_waveform=cnn_waveform,
-            feature_waveform=feature_waveform,
             presence_mask=presence_mask,
             cnn_presence_mask=cnn_presence_mask,
             epoch_valid_mask=epoch_valid_mask,

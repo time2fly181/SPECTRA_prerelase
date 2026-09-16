@@ -38,7 +38,6 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from .anti_alias import KaiserAntiAliasDownsample1D, KaiserAntiAliasUpsample1D
 from .attentive_stats_pooling import (
@@ -46,12 +45,10 @@ from .attentive_stats_pooling import (
     MultiLayerFeatureAggregation,
 )
 from .blocks import FlexiblePhysiologicalStem
-from .checkpointing import batchnorm_safe_checkpoint_context
 from .common import _make_norm1d
-from .dilated_asymmetric_epoch_cnn import MultiDilatedBlock
+from .dilated_blocks import MultiDilatedBlock
 from .learnable_pooling import LatentQueryAttentionPool
-from .learned_feature_bank_cnn import ConstrainedSincFilterBank
-from .recording_conditioning import RecordingConditioner
+from .sinc_filterbank import ConstrainedSincFilterBank
 
 __all__ = [
     "EEGTwoScaleBranch",
@@ -297,7 +294,7 @@ class PerRecordingBandNorm(nn.Module):
         enabled: When False the module is an exact identity and never touches
             its buffers, so existing checkpoints reconstruct bit-for-bit.
         statistic: ``"ema"`` (streaming, default for checkpoint compatibility)
-            or ``"robust"`` (precomputed table; see :meth:`load_table`).
+            or ``"robust"`` (saved robust statistics).
     """
 
     running_mean: torch.Tensor
@@ -412,77 +409,6 @@ class PerRecordingBandNorm(nn.Module):
         mean, var = cls.per_sample_statistics(x)
         return mean.mean(dim=0), var.mean(dim=0)
 
-    @torch.no_grad()
-    def _update(
-        self, x: torch.Tensor, index: torch.Tensor, valid: torch.Tensor
-    ) -> None:
-        stats_dtype = self.running_mean.dtype
-        per_sample_mean, per_sample_var = self.per_sample_statistics(x.to(stats_dtype))
-        for row in torch.unique(index[valid]):
-            sel = valid & (index == row)
-            mean = per_sample_mean[sel].mean(dim=0)
-            var = per_sample_var[sel].mean(dim=0)
-            r = int(row)
-            if int(self.seen_count[r]) == 0:
-                self.running_mean[r] = mean
-                self.running_var[r] = var
-            else:
-                m = self.momentum
-                self.running_mean[r].mul_(1.0 - m).add_(mean, alpha=m)
-                self.running_var[r].mul_(1.0 - m).add_(var, alpha=m)
-            self.seen_count[r] += 1
-
-    @torch.no_grad()
-    def load_table(
-        self,
-        *,
-        rows: torch.Tensor,
-        loc: torch.Tensor,
-        scale: torch.Tensor,
-        reset: bool = True,
-    ) -> None:
-        """Write precomputed ``(loc, scale)`` statistics into buffer ``rows``.
-
-        Rows written this way are marked seen once, which in ``"robust"`` mode
-        means fully trusted. ``reset`` first clears every row so statistics
-        from an earlier run (or an EMA checkpoint) can never leak through.
-
-        Raises:
-            ValueError: On rows outside ``max_recordings`` or a channel
-                mismatch.
-        """
-        rows = rows.reshape(-1).to(self.seen_count.device, torch.long)
-        if rows.numel() and (
-            int(rows.min()) < 0 or int(rows.max()) >= self.max_recordings
-        ):
-            raise ValueError(
-                f"table rows must lie in [0, max_recordings={self.max_recordings})"
-            )
-        loc = loc.detach().to(self.running_mean.device, self.running_mean.dtype)
-        scale = scale.detach().to(self.running_var.device, self.running_var.dtype)
-        if loc.shape != (rows.numel(), self.num_channels) or scale.shape != loc.shape:
-            raise ValueError(
-                f"loc/scale must be [{rows.numel()}, num_channels={self.num_channels}], "
-                f"got {tuple(loc.shape)} and {tuple(scale.shape)}"
-            )
-        if reset:
-            self.reset_table()
-        self.running_mean[rows] = loc
-        self.running_var[rows] = scale.clamp_min(self.eps) ** 2
-        self.seen_count[rows] = 1
-        self._warned_unfilled = False
-
-    @torch.no_grad()
-    def reset_table(self) -> None:
-        """Clear every row so no recording is trusted until loaded again."""
-        self.running_mean.zero_()
-        self.running_var.fill_(1.0)
-        self.seen_count.zero_()
-
-    def filled_rows(self) -> int:
-        """Return how many rows currently hold statistics."""
-        return int((self.seen_count > 0).sum())
-
     def set_table_meta(self, meta: Mapping[str, Any]) -> None:
         """Record provenance of the loaded table (persisted in ``state_dict``)."""
         self._table_meta = dict(meta)
@@ -504,10 +430,6 @@ class PerRecordingBandNorm(nn.Module):
         another recording's statistics silently.
         """
         self._recording_ids = {str(k): int(v) for k, v in mapping.items()}
-
-    def row_for_recording_id(self, recording_id: str) -> int | None:
-        """Return the stored row for ``recording_id``, or ``None`` if unknown."""
-        return getattr(self, "_recording_ids", {}).get(str(recording_id))
 
     def get_extra_state(self) -> dict[str, Any]:
         """Persist the id -> row mapping, statistic mode and table provenance."""
@@ -594,8 +516,6 @@ class PerRecordingBandNorm(nn.Module):
         valid = (index >= 0) & (index < self.max_recordings)
         if not bool(valid.any()):
             return x
-        if self.training and self.statistic == "ema":
-            self._update(x, index, valid)
 
         safe = torch.where(valid, index, torch.zeros_like(index))
         mean = self.running_mean.index_select(0, safe).unsqueeze(-1)
@@ -955,7 +875,6 @@ class EEGTwoScaleBranch(nn.Module):
             norm=norm,
             activation=activation,
             dropout=0.0,
-            use_kaiser=True,
             se_reduction=4,
             return_weights=False,
             aa_cutoff_ratio=fir_cutoff_ratio,
@@ -1487,9 +1406,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         pool_occupancy: bool = True,
         pool_mfa: bool = True,
         pool_dropout: float | None = None,
-        recording_conditioning: bool = False,
-        recording_conditioning_samples: int = 64,
-        recording_conditioning_dim: int = 64,
     ) -> None:
         super().__init__()
         if norm != "bn":
@@ -1553,7 +1469,9 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         self.widths = resolved_widths
         self.dropout = float(dropout)
         self.norm_type = norm
-        self.fs = float(fs)
+        if fs != 128:
+            raise ValueError("SPECTRA requires a fixed sample rate of 128 Hz")
+        self.fs = 128.0
         self.activation = str(activation)
         self.eeg_indices = tuple(int(i) for i in eeg_indices)
         self.eog_indices = tuple(int(i) for i in eog_indices)
@@ -1657,7 +1575,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
                 dropout=self.dropout,
                 norm=norm,
                 activation=self.activation,
-                use_kaiser=True,
                 aa_cutoff_ratio=self.fir_cutoff_ratio,
                 aa_num_taps=self.trunk_fir_taps[stage],
                 aa_beta=self.fir_beta,
@@ -1712,21 +1629,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             )
         self.out_dim = out_dim
         self._temporal_dim = pre_pool
-        self._gradient_checkpointing = False
-        self.recording_conditioning = bool(recording_conditioning)
-        self.recording_conditioning_samples = int(recording_conditioning_samples)
-        self.recording_conditioning_dim = int(recording_conditioning_dim)
-        self.recording_conditioner = (
-            RecordingConditioner(
-                self,
-                stem_width=resolved_widths[0],
-                stage1_width=resolved_widths[1],
-                samples=recording_conditioning_samples,
-                dim=recording_conditioning_dim,
-            )
-            if recording_conditioning
-            else None
-        )
 
     # ------------------------------------------------------------ interface
 
@@ -1734,16 +1636,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
     def temporal_dim(self) -> int:
         """Channel width of the pre-pooling (stage-4) feature map."""
         return self._temporal_dim
-
-    def gradient_checkpointing_enable(self) -> MultiRateAsymmetricEpochCNN:
-        """Enable per-stage gradient checkpointing."""
-        self._gradient_checkpointing = True
-        return self
-
-    def gradient_checkpointing_disable(self) -> MultiRateAsymmetricEpochCNN:
-        """Disable gradient checkpointing."""
-        self._gradient_checkpointing = False
-        return self
 
     def _prepare_input(
         self, x: torch.Tensor, channel_mask: torch.Tensor | None
@@ -1763,17 +1655,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         return x, channel_mask
 
     def _run(self, module: nn.Module, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self._gradient_checkpointing and self.training:
-            return cast(
-                torch.Tensor,
-                checkpoint(
-                    module,
-                    x,
-                    use_reentrant=False,
-                    context_fn=batchnorm_safe_checkpoint_context,
-                    **kwargs,
-                ),
-            )
         return module(x, **kwargs)
 
     def _forward_backbone(
@@ -1783,12 +1664,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         recording_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the stage-3 and stage-4 maps ``[N, C, T']``."""
-        conditioner = self.recording_conditioner
-        context = (
-            conditioner.context(recording_index, x.shape[0], x.device)
-            if conditioner is not None
-            else None
-        )
         x, channel_mask = self._prepare_input(x, channel_mask)
         x = self._run(
             self.multirate_stem,
@@ -1796,11 +1671,7 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             channel_mask=channel_mask,
             recording_index=recording_index,
         )
-        if conditioner is not None and context is not None:
-            x = conditioner.modulate(x, context, 0)
         x = self._run(self.trunk[0], x)
-        if conditioner is not None and context is not None:
-            x = conditioner.modulate(x, context, 1)
         x = self._run(self.trunk[1], x)
         stage3 = self._run(self.trunk[2], x)
         stage4 = self._run(self.trunk[3], stage3)
@@ -1810,11 +1681,9 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         self,
         x: torch.Tensor,
         channel_mask: torch.Tensor | None = None,
-        engineered_features: torch.Tensor | None = None,
         recording_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the stage-4 map as ``[N, T', D]`` (channels last)."""
-        del engineered_features  # accepted for API compatibility; never consumed
         _, stage4 = self._forward_backbone(x, channel_mask, recording_index)
         return stage4.transpose(1, 2)
 
@@ -1822,7 +1691,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         self,
         x: torch.Tensor,
         channel_mask: torch.Tensor | None = None,
-        engineered_features: torch.Tensor | None = None,
         recording_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode a flattened epoch batch to ``[N, out_dim]``.
@@ -1831,7 +1699,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
         context inputs use :meth:`PerRecordingBandNorm.expand_recording_index`
         to repeat each recording id ``L`` times first.
         """
-        del engineered_features  # accepted for API compatibility; never consumed
         stage3, stage4 = self._forward_backbone(x, channel_mask, recording_index)
         pooled_input = (
             self.aggregate([stage3, stage4]) if self.aggregate is not None else stage4
@@ -1905,41 +1772,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             f"{BAND_NORM_MODALITIES}"
         )
 
-    def envelope_submodules(self, modality: str) -> list[nn.Module]:
-        """Return the submodules whose state defines ``modality``'s envelope.
-
-        These are exactly the modules :meth:`modality_envelope` runs the signal
-        through before the per-recording norm (the sinc band bank and its
-        smoother for EEG, the rectifier conv bank and its smoother for EMG). A
-        precomputed statistics table is valid only while their parameters and
-        buffers are unchanged, so the freshness hash and the supervised filter
-        freeze both operate on this set.
-        """
-        if modality == "eeg":
-            branch = self.multirate_stem.eeg_branch
-            return [
-                m
-                for m in (
-                    getattr(branch, "band_filters", None),
-                    getattr(branch, "band_smooth", None),
-                )
-                if m is not None
-            ]
-        if modality == "emg":
-            emg = self.multirate_stem.emg_branch
-            return [
-                m
-                for m in (
-                    getattr(emg, "filters", None),
-                    getattr(emg, "smooth", None),
-                )
-                if m is not None
-            ]
-        raise ValueError(
-            f"unknown band-norm modality {modality!r}; expected one of "
-            f"{BAND_NORM_MODALITIES}"
-        )
-
     def get_attention_stats(self) -> None:
         """Return ``None``; no pooling state is retained between forwards."""
         return None
@@ -1958,9 +1790,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             "eog_indices": self.eog_indices,
             "emg_indices": self.emg_indices,
             "modality_split": self.modality_split,
-            "recording_conditioning": self.recording_conditioning,
-            "recording_conditioning_samples": self.recording_conditioning_samples,
-            "recording_conditioning_dim": self.recording_conditioning_dim,
             "stem_kernel_size": self.stem_kernel_size,
             "eeg_short_dilations": self.eeg_short_dilations,
             "eeg_band_filters": self.eeg_band_filters,

@@ -1,9 +1,0 @@
-SPECTRA is an inference-only extraction of PSGStage source code.
-Source provenance and extraction scope are documented in docs/PROVENANCE.md.
-
-No source-code license has been selected for this repository. This notice does
-not grant an open-source license or change ownership of the original work.
-Select and add the intended license before distributing under license terms.
-
-Third-party dependencies retain their own licenses. Model weights and recording
-data are not included and are subject to their respective owners' terms.

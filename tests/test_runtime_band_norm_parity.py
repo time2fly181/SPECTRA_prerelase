@@ -59,8 +59,11 @@ class EnvelopeProbe(nn.Module):
 def test_public_runtime_pins_normalization(recording: Any, sequential: bool) -> None:
     _, wave, mask = recording
     model = EnvelopeProbe().eval()
-    options = runtime.ScoreOptions(batch_size=2, context_half=0, amp_mode="off")
-    windows = wave[:, None]
+    options = runtime.ScoreOptions(batch_size=2, amp_mode="off")
+    windows, _ = runtime.create_epoch_batches(
+        wave.permute(1, 0, 2).reshape(5, -1).numpy(), np.ones(5), 128, 30, 10
+    )
+    mask_windows = runtime._create_epoch_channel_mask_windows(mask.numpy(), 10)
     with runtime.pinned_recording_band_statistics(
         model,
         windows,
@@ -74,7 +77,7 @@ def test_public_runtime_pins_normalization(recording: Any, sequential: bool) -> 
             torch.ones(5),
             torch.device("cpu"),
             options,
-            epoch_channel_mask=mask[:, None],
+            epoch_channel_mask=mask_windows,
         )
     if sequential:
         actual = runtime.run_inference_sequential(
@@ -83,7 +86,7 @@ def test_public_runtime_pins_normalization(recording: Any, sequential: bool) -> 
             np.ones(5),
             128,
             30,
-            0,
+            10,
             torch.device("cpu"),
             options,
             epoch_channel_valid=mask.numpy(),
@@ -95,13 +98,13 @@ def test_public_runtime_pins_normalization(recording: Any, sequential: bool) -> 
             torch.ones(5),
             torch.device("cpu"),
             options,
-            epoch_channel_mask=mask[:, None],
+            epoch_channel_mask=mask_windows,
         )
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
     assert model.epoch_encoder.recording_norm_modules()["eeg"]._inference_mean is None
 
 
-def test_reasoning_keeps_whole_recording_statistics(
+def test_postprocessing_keeps_whole_recording_statistics(
     recording: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, wave, mask = recording
@@ -109,17 +112,22 @@ def test_reasoning_keeps_whole_recording_statistics(
     norm = model.epoch_encoder.recording_norm_modules()["eeg"]
 
     def postprocess(logits: np.ndarray, **kwargs: Any) -> dict[str, np.ndarray]:
-        assert norm._inference_mean is not None, "refinement lost recording statistics"
+        assert (
+            norm._inference_mean is not None
+        ), "postprocessing lost recording statistics"
         return {"logits": logits}
 
-    monkeypatch.setattr(runtime, "postprocess_logits_with_reasoning", postprocess)
-    runtime.infer_with_reasoning(
+    monkeypatch.setattr(runtime, "postprocess_logits", postprocess)
+    windows, _ = runtime.create_epoch_batches(
+        wave.permute(1, 0, 2).reshape(5, -1).numpy(), np.ones(5), 128, 30, 10
+    )
+    runtime.infer_recording(
         model,
-        wave[:, None],
+        windows,
         torch.ones(5),
         torch.device("cpu"),
-        runtime.ScoreOptions(batch_size=2, context_half=0, amp_mode="off"),
-        epoch_channel_mask=mask[:, None],
+        runtime.ScoreOptions(batch_size=2, amp_mode="off"),
+        epoch_channel_mask=runtime._create_epoch_channel_mask_windows(mask.numpy(), 10),
     )
     assert norm._inference_mean is None
 

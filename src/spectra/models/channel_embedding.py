@@ -30,33 +30,3 @@ class LegacyChannelEmbeddingState(nn.Module):
         self.register_buffer(
             "channel_embed", torch.zeros(1, 1, num_channels, 1), persistent=True
         )
-
-    def reset_parameters(self) -> None:
-        """Keep the compatibility buffer at the identity value."""
-        with torch.no_grad():
-            self.channel_embed.zero_()
-
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Validate and return an unchanged contiguous waveform.
-
-        Args:
-            waveform: [B, L, C, T] raw waveform input
-
-        Returns:
-            [B, L, C, T] unmodified waveform
-        """
-        if waveform.ndim != 4:
-            raise ValueError(
-                f"Expected waveform [B, L, C, T], got {tuple(waveform.shape)}"
-            )
-        if waveform.size(2) != self.num_channels:
-            raise RuntimeError(
-                f"Waveform channel dimension ({waveform.size(2)}) must match the size "
-                f"expected by the model ({self.num_channels})"
-            )
-        return waveform.contiguous()
-
-
-# Public import compatibility for callers that historically constructed the
-# identity module directly. New model code should use the explicit legacy name.
-ChannelEmbedding = LegacyChannelEmbeddingState

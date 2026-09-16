@@ -1,9 +1,4 @@
-"""Learned modality-specific feature-bank CNN for axial sleep staging.
-
-The encoder keeps EEG, EOG, and EMG separate while forming learned feature
-slots.  Once slots are formed, every convolution is grouped by slot so slot
-identity is preserved until feature-axis attention.
-"""
+"""Constrained sinc filters used by the multirate EEG branch."""
 
 from __future__ import annotations
 

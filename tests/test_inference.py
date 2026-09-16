@@ -27,7 +27,7 @@ def test_checkpoint_round_trip(checkpoint_path: Path, model_kwargs: dict) -> Non
             )
         else:
             assert reloaded.state_dict()[key] == value
-    wave = torch.randn(2, 3, 5, 3840)
+    wave = torch.randn(2, 21, 5, 3840)
     mask = torch.tensor([[1, 1, 1, 0, 1], [1, 0, 1, 1, 1]], dtype=torch.float32)
     with torch.no_grad():
         expected = original({"wave": wave, "presence_mask": mask}).logits
@@ -80,9 +80,7 @@ def test_edf_to_export(
         None,
         str(tmp_path),
         device="cpu",
-        options=ScoreOptions(
-            context_half=1, batch_size=2, sequential_loading=sequential
-        ),
+        options=ScoreOptions(batch_size=2, sequential_loading=sequential),
     )
     assert result["n_epochs"] == 14
     assert pinned and all(norm._inference_mean is None for norm in pinned)

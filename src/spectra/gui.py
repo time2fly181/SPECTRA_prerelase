@@ -24,7 +24,7 @@ import numpy as np
 from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
 
 if TYPE_CHECKING:
-    from spectra.inference import ReasoningOptions, ScoreOptions
+    from spectra.inference import ScoreOptions
 
 # Set environment variables BEFORE importing Qt to prevent graphics conflicts
 os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""  # Let Qt auto-detect
@@ -1123,9 +1123,11 @@ def _load_review_signal_payload(
     selected = select_channel_plan(signal_labels, channel_layout)
     aligned_signals = np.stack(
         [
-            harmonized_data[source]
-            if source is not None
-            else np.zeros(raw_signals.shape[1], dtype=np.float32)
+            (
+                harmonized_data[source]
+                if source is not None
+                else np.zeros(raw_signals.shape[1], dtype=np.float32)
+            )
             for _, source in selected
         ]
     )
@@ -5610,7 +5612,6 @@ class InferenceWorker(QThread):
         output_dir: str,
         device: str,
         options: ScoreOptions,
-        reasoning: ReasoningOptions,
         cleanup_paths: list[str] | None = None,
     ):
         super().__init__()
@@ -5620,7 +5621,6 @@ class InferenceWorker(QThread):
         self.output_dir = output_dir
         self.device = device
         self.options = options
-        self.reasoning = reasoning
         self.cleanup_paths = list(cleanup_paths or [])
         self._is_running = True
 
@@ -5636,7 +5636,6 @@ class InferenceWorker(QThread):
                 output_dir=self.output_dir,
                 device=self.device,
                 options=self.options,
-                reasoning=self.reasoning,
                 progress_callback=self._progress_callback,
             )
             if self._is_running:
@@ -7063,9 +7062,7 @@ class InferenceGUI(QMainWindow):
 
         # Advanced Mode checkbox
         self.mode_toggle = QCheckBox("Show expert options")
-        self.mode_toggle.setToolTip(
-            "Show advanced options (MC Dropout, Reasoning, Calibration)"
-        )
+        self.mode_toggle.setToolTip("Show advanced options (MC Dropout, Calibration)")
         self.mode_toggle.setChecked(True)
         self.mode_toggle.stateChanged.connect(self.toggle_advanced_mode)
         self.mode_toggle.setEnabled(False)  # Disabled until Easy Mode is unchecked
@@ -7105,18 +7102,15 @@ class InferenceGUI(QMainWindow):
         # Advanced sections (hidden in Simple mode, require Advanced checkbox)
         self.calibration_group = self.create_calibration_section()
         self.advanced_group = self.create_advanced_section()
-        self.reasoning_group = self.create_reasoning_section()
 
         params_layout.addWidget(self.calibration_group)
         params_layout.addWidget(self.advanced_group)
-        params_layout.addWidget(self.reasoning_group)
 
         # Initially hide non-essential sections (Easy Mode is ON by default)
         self.signal_processing_group.setVisible(False)
         self.inference_group.setVisible(False)
         self.calibration_group.setVisible(False)
         self.advanced_group.setVisible(False)
-        self.reasoning_group.setVisible(False)
 
         params_layout.addStretch()
 
@@ -7924,16 +7918,7 @@ class InferenceGUI(QMainWindow):
 
         # Sampling frequency
         layout.addWidget(QLabel("Target Sampling Frequency (Hz):"), 0, 0)
-        self.fs_spin = QSpinBox()
-        self.fs_spin.setRange(128, 128)
-        self.fs_spin.setValue(128)
-        self.fs_spin.setEnabled(False)
-        self.fs_spin.setToolTip(
-            "Fixed at 128 Hz. All channels are resampled to this rate before "
-            "inference; every model in this project is trained at 128 Hz, so this "
-            "is locked and cannot be changed."
-        )
-        layout.addWidget(self.fs_spin, 0, 1)
+        layout.addWidget(QLabel("128 Hz (fixed)"), 0, 1)
 
         # Epoch duration
         layout.addWidget(QLabel("Epoch Duration (seconds):"), 1, 0)
@@ -7947,17 +7932,7 @@ class InferenceGUI(QMainWindow):
 
         # Context half-width
         layout.addWidget(QLabel("Context Half-Width (epochs):"), 2, 0)
-        self.context_half_spin = QSpinBox()
-        self.context_half_spin.setRange(10, 10)
-        self.context_half_spin.setValue(10)
-        self.context_half_spin.setEnabled(False)
-        self.context_half_spin.setToolTip(
-            "Fixed at 10. Each prediction uses ~10.5 minutes of recording "
-            "(21 epochs total: 10 before and 10 after the scored epoch). This is "
-            "locked to match how the project's models are trained and cannot be changed."
-        )
-        self.context_half_spin.valueChanged.connect(self.on_manual_parameter_change)
-        layout.addWidget(self.context_half_spin, 2, 1)
+        layout.addWidget(QLabel("10 epochs (fixed)"), 2, 1)
 
         # Analysis window (start inclusive, end exclusive). Only this interval is
         # normalized and scored, matching the annotated-span crop used for training.
@@ -8147,13 +8122,6 @@ class InferenceGUI(QMainWindow):
         self._sync_advanced_option_widgets()
         return group
 
-    def _sync_reasoning_widgets(self):
-        """Enable/disable reasoning parameter widgets based on checkboxes."""
-        refine_enabled = self.iter_refine_check.isChecked()
-        self.refinement_passes_spin.setEnabled(refine_enabled)
-        self.refinement_threshold_spin.setEnabled(refine_enabled)
-        self.context_expansion_spin.setEnabled(refine_enabled)
-
     def _sync_advanced_option_widgets(self):
         """Enable advanced widgets only when their parent option is active."""
         mc_enabled = self.mc_dropout_check.isChecked()
@@ -8161,47 +8129,6 @@ class InferenceGUI(QMainWindow):
         self.mc_dropout_rate_spin.setEnabled(mc_enabled)
         self.mc_pooling_combo.setEnabled(mc_enabled)
         self.mc_attention_check.setEnabled(mc_enabled)
-
-    def create_reasoning_section(self) -> QGroupBox:
-        """Create optional reasoning/post-processing section."""
-        group = QGroupBox("Reasoning (Optional)")
-        layout = QGridLayout()
-        group.setLayout(layout)
-
-        # Iterative refinement
-        self.iter_refine_check = QCheckBox("Iterative refinement (uncertain epochs)")
-        self.iter_refine_check.setToolTip(
-            "Multi-pass inference that re-evaluates low-confidence epochs and blends with local context."
-        )
-        self.iter_refine_check.stateChanged.connect(self._sync_reasoning_widgets)
-        layout.addWidget(self.iter_refine_check, 0, 0, 1, 2)
-
-        layout.addWidget(QLabel("Refinement passes:"), 1, 0)
-        self.refinement_passes_spin = QSpinBox()
-        self.refinement_passes_spin.setRange(1, 10)
-        self.refinement_passes_spin.setValue(3)
-        layout.addWidget(self.refinement_passes_spin, 1, 1)
-
-        layout.addWidget(QLabel("Confidence threshold:"), 2, 0)
-        self.refinement_threshold_spin = QDoubleSpinBox()
-        self.refinement_threshold_spin.setRange(0.0, 1.0)
-        self.refinement_threshold_spin.setSingleStep(0.05)
-        self.refinement_threshold_spin.setDecimals(2)
-        self.refinement_threshold_spin.setValue(0.65)
-        layout.addWidget(self.refinement_threshold_spin, 2, 1)
-
-        layout.addWidget(QLabel("Context expansion:"), 3, 0)
-        self.context_expansion_spin = QSpinBox()
-        self.context_expansion_spin.setRange(0, 10)
-        self.context_expansion_spin.setValue(2)
-        self.context_expansion_spin.setToolTip(
-            "How many neighboring epochs to use as a soft prior when refining uncertain epochs."
-        )
-        layout.addWidget(self.context_expansion_spin, 3, 1)
-
-        self._sync_reasoning_widgets()
-        layout.setColumnStretch(2, 1)
-        return group
 
     def setup_logging(self):
         """Setup logging to display in GUI."""
@@ -8893,9 +8820,7 @@ class InferenceGUI(QMainWindow):
 
         return ScoreOptions(
             # Signal processing
-            fs=self.fs_spin.value(),
             epoch_sec=self.epoch_sec_spin.value(),
-            context_half=self.context_half_spin.value(),
             # Analysis window (start inclusive, end exclusive)
             start_epoch=self.start_epoch_spin.value(),
             end_epoch=end_epoch,
@@ -8911,17 +8836,6 @@ class InferenceGUI(QMainWindow):
             mc_dropout_rate=mc_dropout_rate,
             mc_pooling=self.mc_pooling_combo.currentText(),
             mc_include_attention=self.mc_attention_check.isChecked(),
-        )
-
-    def get_reasoning_options(self) -> ReasoningOptions:
-        """Get ReasoningOptions from GUI inputs."""
-        from spectra.inference import ReasoningOptions
-
-        return ReasoningOptions(
-            use_iterative_refinement=self.iter_refine_check.isChecked(),
-            refinement_passes=self.refinement_passes_spin.value(),
-            refinement_threshold=self.refinement_threshold_spin.value(),
-            context_expansion=self.context_expansion_spin.value(),
         )
 
     def start_inference(self):
@@ -8997,7 +8911,6 @@ class InferenceGUI(QMainWindow):
                 output_dir=self.output_dir_edit.text(),
                 device=self.device_combo.currentText(),
                 options=self.get_score_options(),
-                reasoning=self.get_reasoning_options(),
                 cleanup_paths=[temp_channel_layout_path],
             )
         except Exception:
@@ -10224,7 +10137,6 @@ class InferenceGUI(QMainWindow):
         show_advanced = self._advanced_mode and not self._easy_mode
         self.calibration_group.setVisible(show_advanced)
         self.advanced_group.setVisible(show_advanced)
-        self.reasoning_group.setVisible(show_advanced)
 
     def toggle_easy_mode(self, state: int):
         """Toggle Easy Mode - shows/hides most configuration options."""
@@ -10243,7 +10155,6 @@ class InferenceGUI(QMainWindow):
         show_advanced = self._advanced_mode and not self._easy_mode
         self.calibration_group.setVisible(show_advanced)
         self.advanced_group.setVisible(show_advanced)
-        self.reasoning_group.setVisible(show_advanced)
 
         # Disable Advanced Mode checkbox in Easy Mode
         self.mode_toggle.setEnabled(not self._easy_mode)
@@ -10537,13 +10448,6 @@ class InferenceGUI(QMainWindow):
                 self._update_recent_menu("checkpoint")
 
             # Load signal processing settings with validation
-            if "fs" in settings:
-                val = settings["fs"]
-                if (
-                    isinstance(val, (int, float))
-                    and self.fs_spin.minimum() <= val <= self.fs_spin.maximum()
-                ):
-                    self.fs_spin.setValue(int(val))
             if "epoch_sec" in settings:
                 val = settings["epoch_sec"]
                 if (
@@ -10553,15 +10457,6 @@ class InferenceGUI(QMainWindow):
                     <= self.epoch_sec_spin.maximum()
                 ):
                     self.epoch_sec_spin.setValue(int(val))
-            if "context_half" in settings:
-                val = settings["context_half"]
-                if (
-                    isinstance(val, (int, float))
-                    and self.context_half_spin.minimum()
-                    <= val
-                    <= self.context_half_spin.maximum()
-                ):
-                    self.context_half_spin.setValue(int(val))
             if "auto_signal_window" in settings and isinstance(
                 settings["auto_signal_window"], bool
             ):
@@ -10622,39 +10517,6 @@ class InferenceGUI(QMainWindow):
                 ):
                     self.conf_threshold_slider.setValue(int(val))
 
-            # Load reasoning settings
-            if "use_iterative_refinement" in settings and isinstance(
-                settings["use_iterative_refinement"], bool
-            ):
-                self.iter_refine_check.setChecked(settings["use_iterative_refinement"])
-            if "refinement_passes" in settings:
-                val = settings["refinement_passes"]
-                if (
-                    isinstance(val, (int, float))
-                    and self.refinement_passes_spin.minimum()
-                    <= val
-                    <= self.refinement_passes_spin.maximum()
-                ):
-                    self.refinement_passes_spin.setValue(int(val))
-            if "refinement_threshold" in settings:
-                val = settings["refinement_threshold"]
-                if (
-                    isinstance(val, (int, float))
-                    and self.refinement_threshold_spin.minimum()
-                    <= val
-                    <= self.refinement_threshold_spin.maximum()
-                ):
-                    self.refinement_threshold_spin.setValue(float(val))
-            if "context_expansion" in settings:
-                val = settings["context_expansion"]
-                if (
-                    isinstance(val, (int, float))
-                    and self.context_expansion_spin.minimum()
-                    <= val
-                    <= self.context_expansion_spin.maximum()
-                ):
-                    self.context_expansion_spin.setValue(int(val))
-
             # Load View menu settings
             if "font_size" in settings:
                 self.settings["font_size"] = settings["font_size"]
@@ -10686,7 +10548,6 @@ class InferenceGUI(QMainWindow):
             ):
                 self._load_checkpoint_info(self.checkpoint_edit.text().strip())
             self._sync_advanced_option_widgets()
-            self._sync_reasoning_widgets()
             # Re-apply theme stylesheet in case the user previously chose light mode.
             self.apply_stylesheet()
             self.log("Settings loaded successfully", logging.INFO)
@@ -10716,9 +10577,7 @@ class InferenceGUI(QMainWindow):
                     : self.MAX_RECENT_FILES
                 ],
                 # Signal processing
-                "fs": self.fs_spin.value(),
                 "epoch_sec": self.epoch_sec_spin.value(),
-                "context_half": self.context_half_spin.value(),
                 "auto_signal_window": self.auto_signal_window_check.isChecked(),
                 # Inference
                 "batch_size": self.batch_size_spin.value(),
@@ -10730,11 +10589,6 @@ class InferenceGUI(QMainWindow):
                 "mc_pooling": self.mc_pooling_combo.currentText(),
                 "mc_include_attention": self.mc_attention_check.isChecked(),
                 "confidence_threshold": self.conf_threshold_slider.value(),
-                # Reasoning
-                "use_iterative_refinement": self.iter_refine_check.isChecked(),
-                "refinement_passes": self.refinement_passes_spin.value(),
-                "refinement_threshold": self.refinement_threshold_spin.value(),
-                "context_expansion": self.context_expansion_spin.value(),
                 # View settings
                 "font_size": self.settings.get("font_size", 12),
                 "high_contrast": self.settings.get("high_contrast", False),
@@ -10928,10 +10782,8 @@ class InferenceGUI(QMainWindow):
         )
 
         # Reset to defaults
-        self.context_half_spin.setValue(10)
         self.batch_size_spin.setValue(32)
         self.epoch_sec_spin.setValue(30)
-        self.fs_spin.setValue(128)
 
         self.project_state.reset()
         self._update_window_title()
@@ -11010,14 +10862,10 @@ class InferenceGUI(QMainWindow):
 
             # Load parameters
             params = project.get("parameters", {})
-            if "context_half" in params:
-                self.context_half_spin.setValue(params["context_half"])
             if "batch_size" in params:
                 self.batch_size_spin.setValue(params["batch_size"])
             if "epoch_sec" in params:
                 self.epoch_sec_spin.setValue(params["epoch_sec"])
-            if "fs" in params:
-                self.fs_spin.setValue(params["fs"])
             if "device" in params:
                 idx = self.device_combo.findText(params["device"])
                 if idx >= 0:
@@ -11116,10 +10964,8 @@ class InferenceGUI(QMainWindow):
                 },
                 # Parameters
                 "parameters": {
-                    "context_half": self.context_half_spin.value(),
                     "batch_size": self.batch_size_spin.value(),
                     "epoch_sec": self.epoch_sec_spin.value(),
-                    "fs": self.fs_spin.value(),
                     "device": self.device_combo.currentText(),
                     "amp_mode": self.amp_mode_combo.currentText(),
                 },
@@ -12336,7 +12182,6 @@ class InferenceGUI(QMainWindow):
             self._high_contrast_action.setChecked(False)
 
             # Reset spinbox/checkbox values to defaults
-            self.context_half_spin.setValue(10)
             self.batch_size_spin.setValue(32)
             self.epoch_sec_spin.setValue(30)
             self.amp_mode_combo.setCurrentText("fp32")

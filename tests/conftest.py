@@ -70,7 +70,7 @@ def model_kwargs() -> dict:
         "time_len": 3840,
         "num_classes": 5,
         "epoch_encoder_variant": "multirate_asymmetric",
-        "context_epochs": 3,
+        "context_epochs": 21,
         "d_model": 32,
         "nhead": 2,
         "num_layers": 1,
@@ -105,7 +105,7 @@ def checkpoint_path(
             "model_config": {
                 "model_type": "TransformerContextNet",
                 "model_kwargs": model_kwargs,
-                "inference_metadata": {"context_half": 1},
+                "inference_metadata": {"context_half": 10},
             },
         },
         path,

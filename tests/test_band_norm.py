@@ -20,7 +20,7 @@ def test_pinning_changes_logits_and_cleans_up(
         band_norm_modalities="eeg,emg",
     )
     model = TransformerContextNet(**kwargs).eval()
-    wave = torch.randn(3, 3, 5, 3840)
+    wave = torch.randn(3, 21, 5, 3840)
     before = {
         key: value.clone()
         for key, value in model.state_dict().items()

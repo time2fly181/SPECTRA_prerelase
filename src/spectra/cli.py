@@ -25,12 +25,6 @@ def main(argv: list[str] | None = None) -> None:
         "--device", choices=["auto", "cpu", "cuda", "mps"], default="auto"
     )
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument(
-        "--context-half",
-        type=int,
-        default=15,
-        help="Fallback context half-width; saved checkpoint metadata takes precedence",
-    )
     parser.add_argument("--start-epoch", type=int, default=0)
     parser.add_argument(
         "--end-epoch",
@@ -56,10 +50,8 @@ def main(argv: list[str] | None = None) -> None:
     for path in (args.edf, args.checkpoint, args.canonical):
         if path is not None and not path.is_file():
             parser.error(f"File does not exist: {path}")
-    if args.batch_size < 1 or args.context_half < 0 or args.mc_samples < 0:
-        parser.error(
-            "batch-size must be positive; context-half and mc-samples must be nonnegative"
-        )
+    if args.batch_size < 1 or args.mc_samples < 0:
+        parser.error("batch-size must be positive; mc-samples must be nonnegative")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     from spectra.inference import ScoreOptions, score_recording
 
@@ -71,7 +63,6 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
         options=ScoreOptions(
             batch_size=args.batch_size,
-            context_half=args.context_half,
             start_epoch=args.start_epoch,
             end_epoch=args.end_epoch,
             amp_mode=args.amp,

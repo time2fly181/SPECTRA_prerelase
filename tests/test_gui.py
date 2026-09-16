@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -15,10 +16,20 @@ def test_gui_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         InferenceGUI, "get_settings_path", lambda self: tmp_path / "settings.json"
     )
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"fs": 256, "context_half": 15, "use_iterative_refinement": True})
+    )
     app = QApplication.instance() or QApplication([])
     initialize_matplotlib_backend()
     window = InferenceGUI()
     assert "SPECTRA" in window.windowTitle()
+    assert (window.get_score_options().fs, window.get_score_options().context_half) == (
+        128,
+        10,
+    )
+    assert not hasattr(window, "fs_spin")
+    assert not hasattr(window, "context_half_spin")
+    assert not hasattr(window, "iter_refine_check")
     window.show()
     app.processEvents()
     window.close()

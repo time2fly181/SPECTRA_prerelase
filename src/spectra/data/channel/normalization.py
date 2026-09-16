@@ -539,10 +539,8 @@ class PSGNormalizer:
         - Clip hard at ±20 IQR units
 
     Legacy sigma and "keep" modes are kept for backward compatibility but are no
-    longer the default. Any changes to the constants below must be reflected in:
-        - preprocessing/config.py (NormalizationCfg defaults)
-        - preprocessing/normalizer.py (EmbeddedPreproc buffers)
-        - data/channel/normalization.py (normalize_robust defaults)
+    longer the default. EDF inference uses the signal-valid normalization helpers
+    in preprocessing/robust_normalization.py before invoking the model.
     """
 
     # IQR-based normalization defaults

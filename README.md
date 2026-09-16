@@ -34,27 +34,36 @@ uv run spectra \
 ```
 
 Run `uv run spectra --help` for analysis interval, batch size, precision, and MC
-dropout options. A checkpoint's saved context half-width overrides the fallback
-CLI value. Checkpoints with only `context_epochs` use that saved window length.
+dropout options. Sampling is fixed at **128 Hz** and context half-width at **10**
+(**21 epochs** total); neither can be changed in the CLI, GUI, or scoring options.
+Conflicting checkpoint metadata is rejected. TTA and iterative/recurrent refinement
+are removed. MC dropout remains available. The multirate model uses Kaiser
+anti-alias filters; the unused BlurPool implementation is removed.
 
 ## Checkpoints
 
 Supply a trusted PSGStage inference/supervised checkpoint whose
 `model_config.model_kwargs.epoch_encoder_variant` is `multirate_asymmetric`.
 The runtime reconstructs the transformer and the saved
-`multirate_asymmetric_encoder_kwargs`, including band normalization and optional
-recording conditioning. Learned state-dictionary names are preserved. Common
+`multirate_asymmetric_encoder_kwargs`, including band normalization.
+Models are unwrapped; all EDF waveform preprocessing runs through
+`spectra.preprocessing.edf.preprocess_edf` before model inference. Recording
+conditioning and embedded model preprocessing are removed, and checkpoints
+containing either are rejected. Learned state-dictionary names are preserved. Common
 compiled/distributed wrapper prefixes and legacy fixed-filter buffers retain
 their compatibility handling.
 
-Other encoder architectures and standalone CNN or temporal-pretraining
-checkpoints are outside this release. No pretrained weights are bundled, and
+Only waveform-based, epoch-token CNN + transformer inference is included.
+Engineered/YASA features, feature fusion, axial and patch models, other CNN
+architectures, and standalone CNN or temporal-pretraining checkpoints are
+unsupported and rejected during loading. No pretrained weights are bundled, and
 the included tests use synthetic signals and randomly initialized models.
 Checkpoint loading uses PyTorch deserialization; load only files you trust.
 
-Some older checkpoints contain auxiliary heads or source-offset state. Small
-compatibility containers retain that state for reconstruction; their training
-losses and source-specific prediction adjustments are absent.
+Training-only auxiliary heads and source-offset state are excluded through an
+explicit allowlist recorded in the checkpoint load audit. Unknown model weights
+are rejected. Shared sinc filters and dilated convolution blocks remain because
+the multirate encoder uses them; they do not provide alternative model paths.
 
 ## EDF preprocessing
 
@@ -119,6 +128,3 @@ uv build
 See [validation](docs/VALIDATION.md) for checks actually performed. The source
 distribution and wheel are written to `dist/`. The Python distribution is named
 `spectra-sleep-staging`; its import package is `spectra`.
-
-Licensing has not been selected. See [NOTICE](NOTICE). Recordings, checkpoints,
-outputs, and environments are ignored by Git.
