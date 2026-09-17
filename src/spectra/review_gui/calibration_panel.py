@@ -134,8 +134,22 @@ class CalibrationPanel(QWidget):
         labels_arr = np.asarray(labels)
         # Align lengths (reference and predictions may differ by a few epochs).
         min_len = min(probs.shape[0], labels_arr.shape[0])
-        self._probabilities = probs[:min_len]
-        self._labels = labels_arr[:min_len]
+        probs = probs[:min_len]
+        labels_arr = labels_arr[:min_len]
+        # The runtime writes zero rows for unscored epochs and signal gaps.
+        # They are not posteriors and must not contribute to calibration.
+        scored = (
+            np.isfinite(probs).all(axis=1)
+            & (probs >= 0).all(axis=1)
+            & np.isclose(probs.sum(axis=1), 1.0)
+            & (labels_arr >= 0)
+            & (labels_arr < probs.shape[1])
+        )
+        if not np.any(scored):
+            self.clear()
+            return
+        self._probabilities = probs[scored]
+        self._labels = labels_arr[scored]
 
         self._placeholder.setVisible(False)
         self._content.setVisible(True)

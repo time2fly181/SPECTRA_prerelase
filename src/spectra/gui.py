@@ -367,6 +367,8 @@ def _normalize_stage_label(stage: StageInput) -> str:
     if isinstance(stage, int):
         if 0 <= stage < len(STAGE_LABELS):
             return STAGE_LABELS[stage]
+        if stage == -1:
+            return "Unscored"
         return str(stage)
 
     if stage is None:
@@ -546,7 +548,11 @@ def _build_epoch_confidence_records(
         )
         next_stage = None
         next_stage_probability = None
-        if probs is not None and len(probs) == len(STAGE_LABELS):
+        if (
+            0 <= pred_idx < len(STAGE_LABELS)
+            and probs is not None
+            and len(probs) == len(STAGE_LABELS)
+        ):
             alt_probs = np.asarray(probs, dtype=np.float32).copy()
             if 0 <= pred_idx < len(alt_probs):
                 alt_probs[pred_idx] = -np.inf
@@ -560,11 +566,11 @@ def _build_epoch_confidence_records(
                 "epoch_index": index,
                 "time_sec": time_sec,
                 "time_hms": _format_elapsed_time_hms(time_sec),
-                "stage": STAGE_LABELS[int(pred_idx)],
+                "stage": _normalize_stage_label(int(pred_idx)),
                 "stage_numeric": int(pred_idx),
-                "model_stage": STAGE_LABELS[int(pred_idx)],
+                "model_stage": _normalize_stage_label(int(pred_idx)),
                 "model_stage_numeric": int(pred_idx),
-                "final_stage": STAGE_LABELS[final_stage_idx],
+                "final_stage": _normalize_stage_label(final_stage_idx),
                 "final_stage_numeric": final_stage_idx,
                 "confidence": confidence,
                 "uncertainty_score": uncertainty,
@@ -1665,7 +1671,7 @@ def create_hypnogram_canvas_class():
             pred_to_y = {0: 4, 1: 2, 2: 1, 3: 0, 4: 3}
 
             # Convert predictions to y-axis positions
-            y_values = np.array([pred_to_y[p] for p in predictions])
+            y_values = np.array([pred_to_y.get(p, np.nan) for p in predictions])
 
             # Time axis in hours
             n_epochs = len(predictions)
@@ -1689,7 +1695,7 @@ def create_hypnogram_canvas_class():
             )
 
             def _in_window(i: int) -> bool:
-                return w_start <= i < w_end
+                return w_start <= i < w_end and 0 <= predictions[i] <= 4
 
             # Grey-shade the unscored spans before / after the window.
             if (w_start, w_end) != (0, n_epochs):
@@ -2112,7 +2118,11 @@ def create_hypnogram_canvas_class():
                         onset = segment_start * self.epoch_sec
                         duration = (i - segment_start) * self.epoch_sec
                         annotations.append(
-                            (onset, duration, stage_names[current_stage])
+                            (
+                                onset,
+                                duration,
+                                stage_names.get(current_stage, "Unscored"),
+                            )
                         )
                         current_stage = self.predictions[i]
                         segment_start = i
@@ -2120,7 +2130,9 @@ def create_hypnogram_canvas_class():
                 # Add final segment
                 onset = segment_start * self.epoch_sec
                 duration = (w_end - segment_start) * self.epoch_sec
-                annotations.append((onset, duration, stage_names[current_stage]))
+                annotations.append(
+                    (onset, duration, stage_names.get(current_stage, "Unscored"))
+                )
 
             # Create EDF+ annotations file
             with pyedflib.EdfWriter(
@@ -2130,7 +2142,7 @@ def create_hypnogram_canvas_class():
                 f.setPatientName("Anonymous")
                 f.setPatientCode("")
                 f.setTechnician("SPECTRA")
-                f.setRecordingAdditional("Sleep staging annotations")
+                f.setRecordingAdditional("Sleep_staging_annotations")
 
                 # Write annotations
                 for onset, duration, text in annotations:
@@ -2292,7 +2304,7 @@ def create_hypnogram_canvas_class():
                         {
                             "epoch": i + 1,
                             "time_sec": i * self.epoch_sec,
-                            "stage": STAGE_DISPLAY_NAMES[stage],
+                            "stage": STAGE_DISPLAY_NAMES.get(stage, "Unscored"),
                             "confidence": conf,
                         }
                     )
@@ -2351,7 +2363,8 @@ class SleepStatistics:
 
         # Sleep Onset Latency (SOL) - time to first sleep epoch
         sol_min = 0
-        first_sleep_idx = np.where(self.predictions != 0)[0]
+        sleep_mask = (self.predictions >= 1) & (self.predictions <= 4)
+        first_sleep_idx = np.flatnonzero(sleep_mask)
         if len(first_sleep_idx) > 0:
             sol_min = first_sleep_idx[0] * self.epoch_min
 
@@ -2376,7 +2389,7 @@ class SleepStatistics:
 
         # Sleep Period Time (SPT) - time from first sleep to last sleep epoch
         spt_min = 0
-        last_sleep_idx = np.where(self.predictions != 0)[0]
+        last_sleep_idx = first_sleep_idx
         if len(first_sleep_idx) > 0 and len(last_sleep_idx) > 0:
             spt_min = (last_sleep_idx[-1] - first_sleep_idx[0] + 1) * self.epoch_min
 
@@ -2389,13 +2402,17 @@ class SleepStatistics:
         # Number of awakenings (transitions from sleep to wake)
         n_awakenings = 0
         for i in range(1, len(self.predictions)):
-            if self.predictions[i] == 0 and self.predictions[i - 1] != 0:
+            if self.predictions[i] == 0 and sleep_mask[i - 1]:
                 n_awakenings += 1
 
         # Number of stage shifts
         n_stage_shifts = 0
         for i in range(1, len(self.predictions)):
-            if self.predictions[i] != self.predictions[i - 1]:
+            if (
+                0 <= self.predictions[i] <= 4
+                and 0 <= self.predictions[i - 1] <= 4
+                and self.predictions[i] != self.predictions[i - 1]
+            ):
                 n_stage_shifts += 1
 
         # Sleep fragmentation index (stage shifts per hour of sleep)
@@ -6219,7 +6236,8 @@ class SleepArchitectureWidget(QWidget):
         for i in range(len(self.predictions) - 1):
             from_stage = self.predictions[i]
             to_stage = self.predictions[i + 1]
-            trans_matrix[from_stage, to_stage] += 1
+            if 0 <= from_stage < 5 and 0 <= to_stage < 5:
+                trans_matrix[from_stage, to_stage] += 1
 
         # Normalize to percentages (row-wise)
         row_sums = trans_matrix.sum(axis=1, keepdims=True)
@@ -9052,6 +9070,7 @@ class InferenceGUI(QMainWindow):
         probabilities = result.get("probabilities", None)
         output_paths = result.get("output_paths", {})
         confidences = result.get("confidences", None)
+        score_window = result.get("score_window")
 
         # Copy only essential data for display
         if predictions is not None:
@@ -9087,6 +9106,7 @@ class InferenceGUI(QMainWindow):
                     "output_paths": output_paths,
                     "confidences": confidences_copy,
                     "flag_scores": flag_scores_copy or None,
+                    "score_window": score_window,
                 }
             )
 
@@ -11060,6 +11080,7 @@ class InferenceGUI(QMainWindow):
             probabilities=sidecar.get("probabilities"),
             confidences=sidecar.get("confidences"),
             channel_layout=sidecar.get("channel_layout"),
+            score_window=sidecar.get("score_window"),
             flag_scores=sidecar.get("flag_scores"),
             reset_overrides=False,  # keep overrides loaded from .psgproj JSON
             switch_to_hypnogram=True,
@@ -11104,6 +11125,8 @@ class InferenceGUI(QMainWindow):
                 arrays["confidences"] = np.asarray(
                     self.review_state.confidences, dtype=np.float32
                 )
+            if self._score_window is not None:
+                arrays["score_window"] = np.asarray(self._score_window, dtype=np.int64)
             # Per-epoch uncertainty-flag arrays, namespaced to avoid colliding
             # with the reserved sidecar keys above.
             if self.review_state.flag_scores:
@@ -11130,53 +11153,53 @@ class InferenceGUI(QMainWindow):
         """Load cached prediction arrays from a project sidecar .npz.
 
         Returns a dict with keys ``predictions``, ``probabilities``,
-        ``confidences``, ``channel_layout``, ``edf_mtime``, ``edf_size``; or
+        ``confidences``, ``channel_layout``, ``score_window``, ``edf_mtime``,
+        ``edf_size``; or
         ``None`` if the sidecar is missing or unreadable.
         """
         sidecar = Path(project_path).parent / sidecar_name
         if not sidecar.exists():
             return None
         try:
-            data = np.load(sidecar, allow_pickle=True)
+            with np.load(sidecar, allow_pickle=True) as data:
+                result: dict[str, Any] = {
+                    "predictions": np.asarray(data["predictions"], dtype=np.int64),
+                }
+                result["score_window"] = (
+                    tuple(int(value) for value in data["score_window"])
+                    if "score_window" in data.files
+                    else None
+                )
+                for key in ("probabilities", "confidences"):
+                    result[key] = (
+                        np.asarray(data[key], dtype=np.float32)
+                        if key in data.files
+                        else None
+                    )
+                result["channel_layout"] = (
+                    [str(x) for x in data["channel_layout"].tolist()]
+                    if "channel_layout" in data.files
+                    else None
+                )
+                flag_scores = {
+                    name[len("uflag__") :]: np.asarray(data[name], dtype=np.float32)
+                    for name in data.files
+                    if name.startswith("uflag__")
+                }
+                result["flag_scores"] = flag_scores or None
+                result["edf_mtime"] = (
+                    float(data["edf_mtime"][0]) if "edf_mtime" in data.files else 0.0
+                )
+                result["edf_size"] = (
+                    int(data["edf_size"][0]) if "edf_size" in data.files else 0
+                )
+                return result
         except Exception as e:
             self.log(
                 f"Could not read results sidecar {sidecar.name}: {e}",
                 logging.WARNING,
             )
             return None
-        result: dict[str, Any] = {
-            "predictions": np.asarray(data["predictions"], dtype=np.int64),
-        }
-        if "probabilities" in data.files:
-            result["probabilities"] = np.asarray(
-                data["probabilities"], dtype=np.float32
-            )
-        else:
-            result["probabilities"] = None
-        if "confidences" in data.files:
-            result["confidences"] = np.asarray(data["confidences"], dtype=np.float32)
-        else:
-            result["confidences"] = None
-        if "channel_layout" in data.files:
-            result["channel_layout"] = [str(x) for x in data["channel_layout"].tolist()]
-        else:
-            result["channel_layout"] = None
-        flag_scores: dict[str, np.ndarray] = {}
-        for fname in data.files:
-            if fname.startswith("uflag__"):
-                flag_scores[fname[len("uflag__") :]] = np.asarray(
-                    data[fname], dtype=np.float32
-                )
-        result["flag_scores"] = flag_scores or None
-        if "edf_mtime" in data.files:
-            result["edf_mtime"] = float(data["edf_mtime"][0])
-        else:
-            result["edf_mtime"] = 0.0
-        if "edf_size" in data.files:
-            result["edf_size"] = int(data["edf_size"][0])
-        else:
-            result["edf_size"] = 0
-        return result
 
     def _add_to_recent_projects(self, filepath: str):
         """Add a project to the recent projects list."""
@@ -11685,10 +11708,12 @@ class InferenceGUI(QMainWindow):
                     time_hours = np.arange(n_epochs) * epoch_sec / 3600
 
                     pred_to_y = {0: 4, 1: 2, 2: 1, 3: 0, 4: 3}
-                    y_values = np.array([pred_to_y[p] for p in predictions])
+                    y_values = np.array([pred_to_y.get(p, np.nan) for p in predictions])
 
                     for i in range(n_epochs - 1):
                         stage = predictions[i]
+                        if stage not in stage_colors:
+                            continue
                         ax_hypno.plot(
                             [time_hours[i], time_hours[i + 1]],
                             [y_values[i], y_values[i]],

@@ -13,6 +13,7 @@ directly. Callers must align the reference with the EDF epoch grid.
 
 from __future__ import annotations
 
+import csv
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -24,7 +25,7 @@ __all__ = ["parse_reference_hypnogram", "parse_xml_reference"]
 # Small stage-name map used for CSV/TXT columns.
 _CSV_STAGE_MAP: dict[str, int] = {
     "W": 0,
-    "Wake": 0,
+    "WAKE": 0,
     "N1": 1,
     "N2": 2,
     "N3": 3,
@@ -108,65 +109,46 @@ def parse_reference_hypnogram(
 
 def _parse_npz(file_path: Path) -> np.ndarray:
     """Extract the stage array from a ``.npz`` archive by common key names."""
-    data = np.load(file_path)
-    for key in ("predictions", "hypnogram", "stages", "y", "labels"):
-        if key in data:
-            return np.asarray(data[key])
-    return np.asarray(data[list(data.keys())[0]])
+    with np.load(file_path) as data:
+        for key in ("predictions", "hypnogram", "stages", "y", "labels"):
+            if key in data:
+                return np.asarray(data[key])
+        if not data.files:
+            raise ValueError("No stage arrays found in reference archive")
+        return np.asarray(data[data.files[0]])
 
 
 def _parse_csv_or_text(file_path: Path) -> np.ndarray:
-    """Parse a stage column from a CSV/TXT file (pandas, text fallback)."""
-    try:
-        import pandas as pd  # pyright: ignore[reportMissingModuleSource]
+    """Read a named stage column, or the last column of headerless rows.
 
-        df = pd.read_csv(file_path)
-        stage_col = None
-        for col in (
-            "stage",
-            "Stage",
-            "prediction",
-            "Prediction",
-            "label",
-            "Label",
-            "sleep_stage",
-        ):
-            if col in df.columns:
-                stage_col = df[col]
-                break
-        if stage_col is None:
-            stage_col = df.iloc[:, 0]
-
-        if stage_col.dtype == object:
-            return np.array(
-                [
-                    _CSV_STAGE_MAP.get(
-                        str(s).strip(),
-                        int(s) if str(s).strip().isdigit() else 0,
-                    )
-                    for s in stage_col
-                ]
-            )
-        return stage_col.values.astype(int)
-    except Exception:
-        return _parse_text_fallback(file_path)
-
-
-def _parse_text_fallback(file_path: Path) -> np.ndarray:
-    """Simple line-based fallback when pandas cannot read the file."""
-    with open(file_path) as f:
-        lines = f.readlines()
+    Preserve the epoch grid: unknown or missing labels are unscored, and the
+    first stage is data unless an explicit stage-column header is present.
+    """
+    with open(file_path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(line for line in f if not line.lstrip().startswith("#")))
+    if not rows:
+        return np.empty(0, dtype=np.int64)
+    stage_column = -1
+    headers = {"stage", "prediction", "label", "sleep_stage"}
+    for index, value in enumerate(rows[0]):
+        if value.strip().lower() in headers:
+            stage_column = index
+            rows = rows[1:]
+            break
     reference: list[int] = []
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(",")
-        stage_str = parts[-1].strip() if len(parts) > 1 else line
-        if stage_str in _CSV_STAGE_MAP:
-            reference.append(_CSV_STAGE_MAP[stage_str])
-        elif stage_str.isdigit():
-            reference.append(int(stage_str))
+    for row in rows:
+        value = (
+            row[stage_column].strip().upper() if row and stage_column < len(row) else ""
+        )
+        if value in _CSV_STAGE_MAP:
+            stage = _CSV_STAGE_MAP[value]
+        else:
+            try:
+                number = float(value)
+                stage = int(number) if number in range(5) else -1
+            except ValueError:
+                stage = -1
+        reference.append(stage)
     return np.array(reference, dtype=np.int64)
 
 
