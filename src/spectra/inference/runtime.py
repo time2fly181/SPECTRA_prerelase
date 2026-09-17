@@ -2203,7 +2203,7 @@ def _with_recording_band_statistics[**P, R](function: Callable[P, R]) -> Callabl
 
     @wraps(function)
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        from spectra.model.band_norm_access import recording_norm_modules
+        from spectra.models.band_norm_access import recording_norm_modules
 
         values = signature.bind(*args, **kwargs).arguments
         model = values["model"]
@@ -2645,7 +2645,7 @@ def _pin_recording_band_statistics(
         The pinned modules, so the caller can clear them; empty when the model
         has no enabled per-recording norm.
     """
-    from spectra.model.band_norm_access import find_multirate_encoder
+    from spectra.models.band_norm_access import find_multirate_encoder
     from spectra.models.multirate_asymmetric_epoch_cnn import (
         reduce_recording_statistics,
     )
@@ -2743,7 +2743,7 @@ def pinned_recording_band_statistics(
     Yields:
         None. Statistics remain pinned while the context is active.
     """
-    from spectra.model.band_norm_access import recording_norm_modules
+    from spectra.models.band_norm_access import recording_norm_modules
 
     mask = (
         presence_mask

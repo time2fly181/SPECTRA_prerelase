@@ -134,8 +134,7 @@ def test_edf_waveforms_are_preprocessed_once_before_model_inference(
 @pytest.mark.parametrize(
     "module",
     [
-        "spectra.model.wrapped",
-        "spectra.model.recording_conditioning",
+        "spectra.model",
         "spectra.models.recording_conditioning",
         "spectra.preprocessing.normalizer",
         "spectra.preprocessing.config",
