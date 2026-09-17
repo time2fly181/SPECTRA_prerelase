@@ -327,7 +327,17 @@ def _up_down(fin: float, fout: float):
 
 
 def resample_signal(x: np.ndarray, fin: float, fout: float) -> np.ndarray:
-    """Resample signal from fin to fout Hz."""
+    """Polyphase-resample one channel while retaining its physical units.
+
+    Args:
+        x: One-dimensional waveform samples.
+        fin: Positive source sampling frequency in Hz.
+        fout: Positive target sampling frequency in Hz.
+
+    Returns:
+        Float32 waveform at the requested rate using a rational rate ratio.
+        Equal rates only convert dtype and may return the original array.
+    """
     try:
         from scipy.signal import resample_poly  # type: ignore
     except ModuleNotFoundError as exc:  # pragma: no cover

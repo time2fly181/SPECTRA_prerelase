@@ -72,10 +72,23 @@ def open_edf_reader(path: str) -> Iterator[tuple[Any, frozenset[int]]]:
 def select_channel_plan(
     labels: list[str], canonical_channels: list[str] | None = None
 ) -> list[tuple[str, str | None]]:
-    """Resolve five slots using converter priorities and optional GUI overrides.
+    """Resolve five slots using converter priorities and optional overrides.
 
     Generic slot names represent automatic selection. Explicit names use the
     converter's direct/substitution matcher, with rereferencing disabled.
+
+    Args:
+        labels: Recorded EDF channel labels in header order.
+        canonical_channels: Five requested names in EEG/EEG/EOG/EOG/EMG order.
+            ``None`` selects all slots automatically. Generic names in
+            ``CHANNEL_NAMES`` request automatic selection for that slot only.
+
+    Returns:
+        Five ``(requested_name, recorded_name)`` pairs. Missing sources are
+        ``None``. Automatic selection does not enforce frontal/central anatomy.
+
+    Raises:
+        ValueError: If the request has the wrong length or repeats a source.
     """
     requested = CHANNEL_NAMES if canonical_channels is None else canonical_channels
     if len(requested) != 5:
@@ -123,7 +136,17 @@ def select_channel_plan(
 
 @dataclass
 class RecordingSignals:
-    """Selected unnormalized waveforms on the original 30-second epoch grid."""
+    """Selected unnormalized waveforms on the original 30-second epoch grid.
+
+    Attributes:
+        signals: Float32 ``[5, original_n_epochs * 3840]`` at 128 Hz in reader
+            physical units; unavailable channels and incomplete epochs are zero.
+        presence_mask: Uint8 ``[5]`` selection mask; not an epoch-quality mask.
+        channel_names: Requested slot names in EEG/EEG/EOG/EOG/EMG order.
+        channel_mapping: Requested names mapped to recorded names or ``None``.
+        sample_rates: Native sampling rates in Hz keyed by recorded channel.
+        reader_backend: Reader identifier for provenance.
+    """
 
     signals: np.ndarray
     presence_mask: np.ndarray
@@ -135,7 +158,21 @@ class RecordingSignals:
 
 @dataclass
 class PreparedRecording:
-    """Normalized recording and provenance, without requiring stage labels."""
+    """Normalized recording and provenance, without requiring stage labels.
+
+    Attributes:
+        signals_stacked: Contiguous float32 ``[N, 5, 3840]`` dimensionless epochs,
+            where ``N = end_epoch - start_epoch``. Invalid channel epochs are zero.
+        presence_mask: Uint8 ``[5]``; one for channels that can be normalized.
+        epoch_signal_valid: Boolean ``[N, 5]``; true for usable channel epochs.
+        channel_names: Requested names in EEG/EEG/EOG/EOG/EMG order.
+        channel_mapping: Requested names mapped to recorded names or ``None``.
+        normalization: Per-channel scaling statistics over the analysis interval.
+        start_epoch: Inclusive offset into the original EDF epoch grid.
+        end_epoch: Exclusive offset after optional exterior trimming.
+        original_n_epochs: Complete 30-second epochs before cropping.
+        reader_backend: Reader identifier for provenance.
+    """
 
     signals_stacked: np.ndarray
     presence_mask: np.ndarray
@@ -155,7 +192,21 @@ def load_edf_signals(
     """Select recorded channels and resample each directly to 128 Hz.
 
     Missing channels and incomplete channel epochs are zero-filled. Recording
-    duration defines the epoch grid, as in the canonical converter.
+    duration defines the epoch grid, as in the canonical converter. The primary
+    reader uses EDF header physical units; the MNE adapter returns MNE values
+    (volts for voltage channels) at MNE's common sampling rate. Neither path
+    applies model normalization here.
+
+    Args:
+        path: EDF file to read; the source file is never modified.
+        canonical_channels: Optional five-slot request for ``select_channel_plan``.
+
+    Returns:
+        Unnormalized signals, channel availability, and reader provenance.
+
+    Raises:
+        ValueError: If the recording has no complete epoch, no selected channel,
+            an invalid sampling rate, or an unsupported channel request.
     """
     with open_edf_reader(path) as (reader, unusable):
         labels = _labels_for_channel_mapping(list(reader.getSignalLabels()), unusable)
@@ -201,11 +252,32 @@ def preprocess_edf(
     end_epoch: int = -1,
     auto_signal_window: bool = True,
 ) -> PreparedRecording:
-    """Return converter-equivalent float32 epochs, masks, and source mapping.
+    """Read and robust-normalize an EDF analysis interval for model inference.
 
     Use the converter's annotation crop bounds as ``start_epoch`` and
     ``end_epoch`` when comparing against an annotated Zarr. Without bounds,
     inference uses all complete epochs; no labels are invented or required.
+
+    Args:
+        path: EDF file to read.
+        canonical_channels: Optional five-slot request for ``select_channel_plan``.
+        start_epoch: Inclusive zero-based analysis offset; must be nonnegative.
+        end_epoch: Exclusive analysis offset, clipped to recording length.
+            ``-1`` uses the recording end.
+        auto_signal_window: Trim fully invalid exterior epochs after normalization.
+            Interior gaps remain in place with false validity masks.
+
+    Returns:
+        PreparedRecording with normalized epochs and offsets into the source EDF.
+
+    Raises:
+        ValueError: If bounds are invalid or no channel has enough usable epochs.
+
+    Notes:
+        A channel that cannot be normalized is disabled with a warning. Scaling
+        uses only valid epochs, clips the result, then reconciles validity with
+        the stored waveform. See ``normalize_channel_masked_with_validity`` for
+        thresholds and convergence limits. No bandpass or notch filter is applied.
     """
     recording = load_edf_signals(path, canonical_channels)
     original_n_epochs = recording.signals.shape[1] // EPOCH_SAMPLES

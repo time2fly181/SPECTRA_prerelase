@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""
-SPECTRA Inference GUI
+"""Desktop EDF scoring, waveform review, reference comparison, and export.
 
-A comprehensive graphical interface for scoring EDF files using trained models.
-Provides access to all inference parameters with a user-friendly interface.
+Scoring delegates to ``spectra.inference.runtime``. Display filters affect only
+waveform viewing. Import configures Qt rendering; launch with ``spectra-gui``
+or the repository's ``inference_gui.py`` entry point.
 """
 
 from __future__ import annotations
@@ -32,9 +32,6 @@ os.environ["QT_OPENGL"] = "software"  # Use software OpenGL to avoid GPU conflic
 os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get(
     "CUDA_VISIBLE_DEVICES", "0"
 )  # Ensure CUDA device is set
-
-# Add src to path
-
 
 from spectra.inference_gui.state import (  # noqa: E402
     InferenceRunState,

@@ -2,10 +2,10 @@
 
 This module implements algebraic channel derivation through "telescoping"
 bipolar montages. If target derivations aren't directly available, they can
-be computed from available pairs using linear combinations.
+be computed from available pairs using linear combinations. These helpers are
+available to channel-utility callers; the EDF scoring pipeline disables them.
 
-Mathematical Background
------------------------
+Mathematical background:
 Any bipolar derivation is a linear combination of electrode potentials:
     (C4-A1) = potential(C4) - potential(A1)
 
@@ -13,8 +13,7 @@ If you have the right pairs, you can telescope them:
     C4-A1 = (C4-P4) + (P4-A1)    [X-Y + Y-Z = X-Z]
     C4-A1 = (C4-A2) - (A1-A2)    [X-B + B-Y = X-Y when A1-A2 is backwards]
 
-Matrix Representation
----------------------
+Matrix representation:
 Let v(t) be a vector of electrode potentials at time t.
 Any derivation can be written as: out = M @ v
 where M has +1 for positive pole, -1 for reference pole, 0 elsewhere.
@@ -27,8 +26,7 @@ Example:
 This module builds transformation matrices at load time to derive
 canonical montages from whatever montage was recorded.
 
-Usage
------
+Example:
     >>> from spectra.data.channel import build_derivation_matrix, can_derive_channel
     >>> available = ['C4-P4', 'P4-A1', 'C3-A2']
     >>> target = 'C4-A1'

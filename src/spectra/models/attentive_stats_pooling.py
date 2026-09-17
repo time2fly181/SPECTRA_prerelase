@@ -1,25 +1,13 @@
 """Attentive-statistics pooling over sub-epoch frames.
 
-Speaker-verification systems (x-vector -> ECAPA-TDNN) converged on one recipe
-for collapsing 10-30 s of variable-content signal into a single embedding:
-attention weights computed **per channel** and conditioned on a global context
-summary, used to take a weighted *mean and standard deviation* over time,
-preceded by aggregation of feature maps from several depths. Compared with the
-latent-query pool used by the existing epoch encoders this adds second-order
-statistics (burstiness of EMG tone, intermittency of spindles), lets every
-feature map pick its own diagnostic seconds of the epoch, and optionally keeps
-the occupancy (duty-cycle) statistic from :mod:`spectra.models.occupancy_pooling`,
-because several AASM rules *are* occupancy rules.
+ECAPA-style attention uses a global context summary to weight temporal means
+and standard deviations separately for each head and feature channel. Optional
+soft occupancy statistics are implemented in this module. Multi-layer feature
+aggregation can combine trunk maps before pooling.
 
-Two repository rules are honoured by construction:
-
-* **Nothing built inside ``forward`` is cached on ``self``.** SupCon calls the
-  encoder twice per step before one backward pass and CUDA-graph capture does
-  not tolerate a tensor attribute written during replay. Diagnostics are
-  exposed as explicit helper methods instead (:meth:`attention_weights`,
-  :meth:`pooled_statistics`).
-* **Variances are computed in fp32.** Under bf16 autocast the weighted second
-  moment would otherwise lose the small ``E[x^2] - E[x]^2`` difference.
+Forward calls do not cache intermediate tensors on the module; explicit helper
+methods expose attention weights and pooled statistics. Variances are computed
+in float32 to reduce cancellation in ``E[x^2] - E[x]^2`` under mixed precision.
 """
 
 from __future__ import annotations

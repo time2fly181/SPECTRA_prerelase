@@ -36,7 +36,13 @@ class InferenceRunState:
 
 @dataclass(slots=True)
 class ReviewSessionState:
-    """Prediction, review, and waveform state for the selected recording."""
+    """Prediction, review, and waveform state for the selected recording.
+
+    Prediction arrays use the original EDF epoch grid with labels 0-4 in
+    Wake/N1/N2/N3/REM order and -1 for unscored epochs. ``base_predictions``
+    holds model output; ``predictions`` includes manual overrides. Overrides
+    do not recompute probabilities, confidence, or uncertainty arrays.
+    """
 
     base_predictions: np.ndarray | None = None
     predictions: np.ndarray | None = None

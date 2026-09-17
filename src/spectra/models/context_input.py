@@ -15,8 +15,8 @@ class PreparedContextWaveforms(NamedTuple):
     """Canonical tensors shared by every context-model encoder path.
 
     Attributes:
-        waveform: Contiguous physical waveform with shape ``[B, L, C, T]``.
-            Values are unchanged.
+        waveform: Contiguous preprocessed waveform ``[B, L, C, T]``.
+            Values are unchanged; EDF inputs have dimensionless normalized units.
         cnn_waveform: Finite, presence-masked waveform with shape
             ``[B * L, C, T]``.
         presence_mask: Actual channel presence with shape ``[B * L, C]``, or
@@ -40,7 +40,7 @@ class PreparedContextWaveforms(NamedTuple):
 class ContextWaveformPreparer(nn.Module):
     """Validate and canonicalize waveform inputs for context models.
 
-    This module is the single seam for waveform shape validation, channel-mask
+    This module handles waveform shape validation, channel-mask
     expansion, epoch-validity derivation, CNN sanitation, and all-missing epoch
     handling. It intentionally does not own resampling or normalization, which
     happen before the model.
@@ -60,19 +60,22 @@ class ContextWaveformPreparer(nn.Module):
         self.samples_per_epoch = int(samples_per_epoch)
 
     def forward(self, inputs: WaveformInputs) -> PreparedContextWaveforms:
-        """Prepare a waveform tensor or mapping for all encoder variants.
+        """Prepare preprocessed waveforms and masks for the multirate encoder.
 
         Args:
-            inputs: A ``[B, L, C, T]`` tensor, or a mapping containing ``wave``
-                and optional ``presence_mask`` (legacy ``mask``),
-                and ``epoch_valid_mask`` tensors.
+            inputs: Floating ``[B, 21, C, T]`` tensor, or a mapping containing
+                ``wave``, optional ``presence_mask`` (legacy ``mask``),
+                ``epoch_valid_mask``, and ``recording_index`` tensors. Presence
+                accepts ``[C]``, ``[B, C]``, or ``[B, 21, C]``; epoch validity
+                is ``[B, 21]``. True means usable. Recording indices are ``[B]``.
+                Masks are moved to the waveform device and converted to bool.
 
         Returns:
             Canonical waveform, mask, and validity tensors.
 
         Raises:
             TypeError: If an input field has the wrong type.
-            ValueError: If a tensor has an unsupported shape or device.
+            ValueError: If a tensor has an unsupported shape.
             RuntimeError: If the waveform channel count does not match the model.
         """
         mapping: Mapping[str, object] | None

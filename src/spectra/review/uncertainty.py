@@ -7,11 +7,8 @@ those into a single direction-normalized *uncertainty* score (higher = more
 uncertain) and ranks epochs by it, so the GUI can present a "most uncertain
 first" review worklist.
 
-All functions are pure NumPy and Qt-free so they can be unit-tested directly::
-
-    >>> from spectra.review.uncertainty import combine_flag_score
-    >>> combine_flag_score(margin=None, entropy=None, maxprob=None)
-    (None returned when the requested array is absent)
+All functions are pure NumPy and Qt-free. Missing requested flag arrays return
+``None``; callers choose any fallback policy.
 """
 
 from __future__ import annotations
@@ -92,7 +89,7 @@ def rank_epochs_by_uncertainty(
         ``scores`` is empty or ``mask`` excludes everything.
 
     Raises:
-        ValueError: If ``scores`` is not 1-D, or ``mask`` shape mismatches.
+        ValueError: If the flattened mask shape does not match flattened scores.
     """
     scores = np.asarray(scores, dtype=np.float64).ravel()
     indices = np.arange(scores.shape[0])

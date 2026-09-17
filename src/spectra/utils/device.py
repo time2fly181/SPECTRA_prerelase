@@ -1,3 +1,5 @@
+"""Autocast contexts with reported backend fallback and exception propagation."""
+
 from __future__ import annotations
 
 import logging
@@ -83,12 +85,14 @@ def autocast_context(
 ) -> Generator[None, None, None]:
     """Return an autocast context manager.
 
-    Supports two signatures for backward-compatibility with existing code:
+    Supports these calling conventions for compatibility:
     - autocast_context(device: torch.device, dtype: Optional[torch.dtype])
     - autocast_context(device: str, use_amp: bool, amp_dtype: torch.dtype)
     - autocast_context(..., dtype=..., use_amp=...) (keyword-friendly)
 
     When AMP is enabled, supports both fp16 (torch.float16) and bf16 (torch.bfloat16).
+    Unsupported autocast setup emits a warning and continues without autocast.
+    Exceptions raised by the wrapped model body are propagated.
     """
     # Honor keyword overrides if provided
     kw_dtype = dtype

@@ -1,9 +1,8 @@
-"""Calibration evaluation utility for saved PSG scoring probabilities.
+"""Epoch-level probability calibration and reliability curves for GUI and API use.
 
-Run with:
-    python -m spectra.diagnostics.calibration_eval \
-        --probabilities path/to/recording_probabilities.npy \
-        --labels path/to/recording_labels.npy
+These functions compare confidence with reference-label accuracy. Inputs must
+already be aligned on the same epoch grid. Filter unscored model rows before
+calling: label masking does not remove zero probability rows. No CLI is provided.
 """
 
 from __future__ import annotations
@@ -32,7 +31,19 @@ _STAGE_TO_INDEX = {
 
 
 def multiclass_brier_score(probs: np.ndarray, labels: np.ndarray) -> float:
-    """Return the multiclass Brier score for probabilities and integer labels."""
+    """Return mean per-epoch squared probability error summed over classes.
+
+    Args:
+        probs: Finite normalized probabilities ``[N, K]`` in stage order.
+        labels: Integer class indices ``[N]`` in ``[0, K)``; no ignored labels.
+
+    Returns:
+        Float64-derived scalar, or zero for no epochs. The class sum is not
+        divided by ``K``. Probability normalization is the caller's responsibility.
+
+    Raises:
+        ValueError: If shapes disagree or labels are outside the class range.
+    """
     if probs.ndim != 2:
         raise ValueError(f"Expected probs shape [N, K], got {probs.shape}")
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
@@ -58,7 +69,25 @@ def evaluate_calibration(
     n_bins: int = 15,
     drop_invalid: bool = True,
 ) -> dict[str, float | int]:
-    """Compute accuracy, ECE-family metrics, and multiclass Brier score."""
+    """Compare epoch-level confidence with aligned reference-label accuracy.
+
+    Args:
+        probabilities: Finite normalized ``[N, K]`` probabilities. For SPECTRA,
+            columns are Wake, N1, N2, N3, REM. Exclude unscored rows first.
+        labels: Integer reference labels ``[N]`` on the same epoch grid.
+        n_bins: Positive number of equal-width confidence bins over ``[0, 1]``.
+        drop_invalid: Exclude labels outside ``[0, K)`` (including ``-1``).
+            This does not validate or filter probability rows.
+
+    Returns:
+        Sample/class counts, accuracy, average confidence, ECE, MCE, signed
+        overconfidence (confidence minus accuracy), and multiclass Brier score.
+        ECE weights bin gaps by epoch fraction. Bins are left-open/right-closed;
+        zero confidence is not binned. Empty inputs return zero-valued metrics.
+
+    Raises:
+        ValueError: If shapes disagree, or invalid labels remain for Brier scoring.
+    """
     probs = np.asarray(probabilities, dtype=np.float64)
     labels_arr = np.asarray(labels, dtype=np.int64).reshape(-1)
 

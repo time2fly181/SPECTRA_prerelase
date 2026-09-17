@@ -10,9 +10,8 @@ class LegacyChannelEmbeddingState(nn.Module):
     """Preserve the historical channel-offset checkpoint schema.
 
     Older checkpoints contain ``channel_embedding.channel_embed`` as a learned
-    DC offset. A constant raw-signal offset is not a useful channel identity
-    embedding for modality-aware CNNs and creates a pretrain/fine-tune mismatch.
-    This adapter remains registered solely so those checkpoints load without a
+    DC offset. The current model does not apply this offset to waveforms.
+    This adapter remains registered so those checkpoints load without a
     state-dict migration. Runtime input semantics live in
     :class:`spectra.models.context_input.ContextWaveformPreparer`.
 

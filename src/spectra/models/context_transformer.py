@@ -1,6 +1,4 @@
-"""
-Transformer-based context model for PSG sleep staging.
-"""
+"""Transformer-based context model for PSG sleep staging."""
 
 from __future__ import annotations
 
@@ -29,14 +27,7 @@ from .normalization import VariancePreservingRMSNorm
 
 @dataclass
 class ForwardOutput:
-    """
-    Structured output from TransformerContextNet.forward().
-
-    Using a dataclass instead of tuples provides:
-    - Self-documenting field names
-    - Consistent return structure regardless of which outputs are requested
-    - Easier to extend with new output fields
-    - Better IDE autocomplete and type checking
+    """Structured output from ``TransformerContextNet.forward``.
 
     Attributes:
         logits: Class prediction logits, shape [B, num_classes] or [B, L, num_classes].
@@ -44,6 +35,8 @@ class ForwardOutput:
             Shape [B, d_model] or [B, L, d_model]. None if not requested.
         attention_weights: Attention weights from the last transformer layer.
             Shape [B, H, L, L]. None if not requested.
+        readout_attention_weights: Optional center-readout attention; its shape
+            depends on the checkpoint's readout implementation.
         confidence: Predicted probability that the stage prediction is correct.
             Shape [B] or [B, L]. None if the confidence head is disabled.
     """
@@ -748,7 +741,15 @@ class RelativeMultiheadCenterReadout(nn.Module):
 
 
 class TransformerContextNet(nn.Module):
-    """Multirate asymmetric CNN and context transformer for EDF inference."""
+    """Multirate asymmetric CNN and context transformer for normalized waveforms.
+
+    Each 30-second epoch becomes a CNN embedding; the transformer combines 21
+    embeddings before stage classification. Inputs are floating ``[B, 21, 5, 3840]``
+    tensors at 128 Hz, already normalized by the EDF preprocessing pipeline.
+    The model does not perform EDF preprocessing. Checkpoint metadata determines
+    encoder, attention, pooling, and classifier settings; use the runtime loader
+    to reconstruct a saved model. See ``ContextWaveformPreparer`` for mask rules.
+    """
 
     def _encoder_recording_kwargs(
         self, recording_index: torch.Tensor | None, batch: int, context_len: int
@@ -1252,24 +1253,28 @@ class TransformerContextNet(nn.Module):
         return_attention: bool = False,
         stage_labels: torch.Tensor | None = None,
     ) -> ForwardOutput:
-        """
-        Forward pass.
+        """Return stage logits and optional features and attention tensors.
 
         Args:
-            inputs: Input tensor or mapping with 'wave' key.
-            predict_all: If True, return predictions for all epochs.
-            return_features: If True, return tuple (logits, features).
+            inputs: Preprocessed floating ``[B, L, C, T]`` tensor with
+                ``L=21, C=5, T=3840``, or a mapping with ``wave`` and masks as
+                documented by ``ContextWaveformPreparer``. Use the model device.
+            predict_all: Return logits for every context position instead of
+                the center readout. Padded positions still require caller masking.
+            return_features: Populate the output's ``features`` field.
             return_attention: If True, return attention weights from the last
                 transformer encoder layer. The attention weights have shape
                 [B, n_heads, seq_len, seq_len] where seq_len is the context length.
                 Useful for attention visualization and interpretability analysis.
-            stage_labels: Optional stage labels (currently unused).
+            stage_labels: Compatibility argument; ignored.
 
         Returns:
-            logits: [B, num_classes] or [B, L, num_classes] if predict_all=True.
-            If return_features=True, returns (logits, features).
-            If return_attention=True, attention weights are appended as the last element
-                of the returned tuple. Shape: [B, n_heads, seq_len, seq_len].
+            ForwardOutput with ``logits`` shaped ``[B, 5]`` or ``[B, L, 5]``.
+            Optional ``features`` are ``[B, d_model]`` or ``[B, L, d_model]``
+            for center or all-position output. Attention and confidence fields
+            depend on the requested outputs and checkpoint configuration.
+            This method does not disable gradients; inference callers select
+            evaluation mode and a no-grad context.
         """
         del stage_labels
         self._last_confidence_logits = None

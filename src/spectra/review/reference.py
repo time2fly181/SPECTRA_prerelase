@@ -5,10 +5,10 @@ Supports the formats the inference GUI accepts: ``.npy``/``.npz`` arrays,
 annotations (both the time-based ``ScoredEvent`` shape and the sequential
 ``SleepStage`` shape).
 
-The parsing here was extracted verbatim from the GUI so both the hypnogram
-canvas and the new Validation panels share one source of truth. All functions
-return a 1-D ``int64`` array of stage indices (``0=Wake .. 4=REM``, ``-1`` for
-unscored epochs) and raise :class:`ValueError` on unusable input.
+The public parsers return a 1-D ``int64`` array in Wake/N1/N2/N3/REM order
+(``0`` through ``4``), with ``-1`` for unscored epochs. XML numeric NSRR codes
+map N4 to N3 and REM code 5 to index 4. Array inputs use the five-class indices
+directly. Callers must align the reference with the EDF epoch grid.
 """
 
 from __future__ import annotations

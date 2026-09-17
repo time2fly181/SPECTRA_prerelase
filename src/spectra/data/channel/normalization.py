@@ -1,8 +1,8 @@
 """Utilities for normalising PSG channel labels and signals.
 
-This module provides:
-- Channel label normalization for matching and aliasing
-- Robust percentile-based signal normalization
+Channel-label normalization supports EDF matching and aliasing. The generic
+signal normalizers are compatibility utilities; EDF scoring uses the masked
+normalization in ``spectra.preprocessing.robust_normalization`` instead.
 """
 
 from __future__ import annotations
@@ -528,11 +528,11 @@ def normalize_robust(
 
 
 class PSGNormalizer:
-    """Single source of truth for PSG normalization.
+    """Generic configurable signal normalizer retained for compatibility.
 
-    This class centralizes the normalization logic so training, offline
-    preprocessing, and inference stay in sync. The recommended strategy is the
-    IQR-based scaling described in the Nature paper:
+    Class attributes configure unmasked IQR, sigma, or pass-through scaling.
+    The original implementation attributes the IQR strategy to a Nature paper
+    without a specific citation; the operations implemented here are:
 
         - Subtract per-channel median
         - Divide by interquartile range (Q3-Q1)

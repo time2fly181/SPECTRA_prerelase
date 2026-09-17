@@ -3,8 +3,8 @@
 This module handles common channel naming variations and provides
 reference substitution (e.g., A1/A2 ↔ M1/M2) for missing channels.
 
-Now includes linear re-referencing support for deriving channels
-through algebraic telescoping when direct matches aren't available.
+Explicit derivation helpers also support algebraic rereferencing. The EDF
+scoring path uses direct/substitution matching with rereferencing disabled.
 """
 
 from __future__ import annotations
@@ -15,8 +15,6 @@ from typing import Any
 from .normalization import infer_channel_type as _infer_channel_type
 
 try:
-    pass
-
     from .rereferencing import (
         build_montage_transform,
     )

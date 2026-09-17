@@ -1,7 +1,4 @@
-# spectra.models/common.py
-"""
-Common utilities, constants, and base components for PSG models.
-"""
+"""Attention backend selection, initialization, and normalization factories."""
 
 from __future__ import annotations
 
@@ -9,10 +6,6 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
-
-# ---------------------------
-# SDPA backend context
-# ---------------------------
 
 try:
     from torch.nn.attention import (
@@ -60,22 +53,12 @@ def _sdp_kernel_context(policy: str):
         return nullcontext()
 
 
-# ---------------------------
-# Common utilities
-# ---------------------------
-
-
 def transformer_init_(module: nn.Module) -> None:
-    """Xavier init for Transformer layers with GELU activation.
+    """Initialize supported layers in place for model construction.
 
-    Applies Xavier (Glorot) initialization to linear layers, which is more
-    appropriate for GELU activations than Kaiming (which assumes ReLU-like
-    half-rectifier behavior). GELU is smoother and closer to linear near zero,
-    making Xavier's fan_avg variance scaling more suitable for deep transformer
-    stacks with pre-LayerNorm.
-
-    For Conv1d layers (in CNN encoders), keeps Kaiming initialization as it
-    works well for feature extraction even with GELU.
+    Linear weights use Xavier uniform initialization; Conv1d weights use Kaiming
+    normal with ReLU gain. Normalization scales start at one and biases at zero.
+    Checkpoint loading subsequently replaces saved parameters.
     """
     if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight)
@@ -86,7 +69,6 @@ def transformer_init_(module: nn.Module) -> None:
             nn.init.ones_(module.weight)
         if hasattr(module, "bias") and module.bias is not None:
             nn.init.zeros_(module.bias)
-    # Keep Kaiming for Conv1d in CNN encoder (works well for feature extraction)
     elif isinstance(module, nn.Conv1d):
         nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
         if module.bias is not None:

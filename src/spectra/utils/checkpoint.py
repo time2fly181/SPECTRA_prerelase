@@ -1,3 +1,5 @@
+"""Checkpoint key normalization and fixed-filter reconstruction adapters."""
+
 from __future__ import annotations
 
 import logging

@@ -1,31 +1,11 @@
-"""MultiRateAsymmetricEpochCNN: per-modality multi-rate front-end + attentive stats.
+"""Multirate EEG/EOG/EMG epoch encoder and recording-level envelope normalization.
 
-EEG, EOG and chin EMG live at different frequencies and time scales, yet the
-``flexible_asymmetric`` stem processes all three with the same 9-tap kernel at
-128 Hz, the same 2x anti-aliased decimation (27 Hz cutoff after a single
-convolution + GELU) and only different dilation sets. Chin EMG tone (10-100 Hz)
-therefore survives only as whatever that one nonlinearity demodulates, EOG
-(0.3-5 Hz) is processed at 128 Hz through a 0.87 s receptive field, and no path
-resolves EEG bands at the input rate. This encoder keeps the flexible trunk,
-widths and stride schedule bit-for-bit (so stem and pool effects are isolable)
-and replaces only the two ends::
-
-    input [N, 5, 3840] @ 128 Hz
-      multirate_stem ................................. [N, widths[0], 1920] @ 64 Hz
-        EEG  -> FlexiblePhysiologicalStem (short, multi-dilation)          (waveform path)
-             ++ per-channel sinc band filters (1 s) -> |.| -> LPF -> log1p  (band-power path)
-        EOG  -> Kaiser decimate x8 -> dilated convs @ 16 Hz (RF ~4 s) -> upsample x4
-        EMG  -> short full-band conv @ 128 Hz -> |.| -> LPF -> log1p (envelope) -> decimate x2
-        concat -> 1x1 fusion
-      trunk: 4 x (2 MultiDilatedBlock), identical to flexible_asymmetric
-      pool:  MultiLayerFeatureAggregation(stage3, stage4) -> AttentiveStatisticsPool
-             (or the flexible LatentQueryAttentionPool for ablation)
-
-Every hyper-parameter is a constructor kwarg re-emitted by :meth:`get_config`,
-which is a *pure* constructor round trip so the encoder can ride the opaque
-``EPOCH_ENCODER_KWARG_PASSTHROUGH`` mechanism. Attribute names deliberately avoid
-the ones ``utils/model_config.py`` re-emits on presence alone (``stem``,
-``stage_strides``, ``modality_ratios``, ``aa_*`` ...).
+The stem combines EEG short convolutions and rectified sinc-band envelopes,
+lower-rate EOG convolutions, and rectified EMG convolution envelopes. Fused
+features pass through a dilated trunk and configurable temporal pooling.
+Rectification here uses magnitude, not squared power. Constructor arguments and
+``get_config()`` define the checkpoint's filter, stride, width, and pooling
+settings; the README describes the end-to-end inference data contract.
 """
 
 from __future__ import annotations
@@ -151,15 +131,12 @@ def _fit_length(y: torch.Tensor, length: int) -> torch.Tensor:
     return F.pad(y, (0, length - current), mode="replicate")
 
 
-# ------------------------------------------------- per-recording band norm
-
-
 BAND_NORM_STATISTICS: tuple[str, ...] = ("ema", "robust")
 """Statistic modes for :class:`PerRecordingBandNorm`.
 
-``"ema"`` is the original streaming estimate (mean level, root-mean within-epoch
-variance). ``"robust"`` is the precomputed, composition-robust estimate (10th
-percentile of the per-epoch level, root-median within-epoch variance).
+``"ema"`` uses mean level and root-mean within-epoch variance. ``"robust"``
+uses a low quantile of epoch levels and root-median within-epoch variance.
+``ROBUST_LOCATION_QUANTILE`` defines the runtime's robust location quantile.
 """
 
 ROBUST_LOCATION_QUANTILE = 0.10
@@ -168,9 +145,9 @@ ROBUST_LOCATION_QUANTILE = 0.10
 def _as_reduction_input(x: torch.Tensor) -> torch.Tensor:
     """Move ``[N, C]`` per-epoch statistics to float64 on CPU.
 
-    Tables built during training and statistics pinned at inference must be
-    bit-identical whatever device produced the envelopes, so every reduction
-    runs in one dtype on one device.
+    Reductions share one dtype and device. Inputs are detached, so recording
+    statistics do not carry gradients. This does not guarantee identical
+    upstream envelope values across devices or precision modes.
     """
     if x.ndim != 2:
         raise ValueError(f"expected [N, C] per-epoch statistics, got {tuple(x.shape)}")
@@ -198,16 +175,18 @@ def robust_recording_statistics(
     location_quantile: float = ROBUST_LOCATION_QUANTILE,
     eps: float = 1e-5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Composition-robust reduction of per-epoch ``[N, C]`` statistics.
+    """Reduce per-epoch statistics using quantiles rather than arithmetic means.
 
-    The mean level of a night moves with its stage mix (more N3 raises the
-    delta level, more wake raises the beta level), so normalising by it shifts
-    the decision boundary per night. The lower quantile of the level and the
-    median within-epoch variance move an order of magnitude less.
+    Args:
+        per_epoch_mean: Envelope levels ``[N, C]`` for valid epochs.
+        per_epoch_var: Within-epoch variances ``[N, C]`` for those same epochs.
+        location_quantile: Quantile of epoch levels, using linear interpolation.
+        eps: Variance floor before taking the square root.
 
     Returns:
         ``(loc, scale)`` with ``loc = quantile_N(level, q)`` and
-        ``scale = sqrt(median_N(within-epoch variance))``, both ``[C]`` float64.
+        ``scale = sqrt(median_N(within-epoch variance))``, both ``[C]`` float64
+        on CPU without gradients. Median uses linear quantile interpolation.
     """
     mean = _as_reduction_input(per_epoch_mean)
     var = _as_reduction_input(per_epoch_var)
@@ -258,41 +237,31 @@ def parse_band_norm_modalities(spec: str) -> tuple[str, ...]:
 
 
 class PerRecordingBandNorm(nn.Module):
-    """Normalise the EEG band-power envelope by per-recording running statistics.
+    """Normalize modality envelopes using saved or pinned recording statistics.
 
-    The sinc band path emits an *absolute* ``log1p`` band-power level, so it
-    inherits each recording's delta amplitude (montage, analog filtering,
-    electrode impedance). Out of domain this displaces the N2-vs-N3 decision
-    boundary; correcting it at inference recovers the loss but costs in-domain
-    accuracy, because the model was trained on un-normalised envelopes. This
-    module puts the same correction *inside training* so there is no
-    train/test mismatch to pay for.
+    Evaluation with pinned statistics applies ``(x - mean) / std`` followed by
+    saved reference scale and location. The runtime computes those statistics
+    from valid epochs of the current recording using ``reduce_recording_statistics``.
+    Its ``ema`` reducer uses mean level and mean within-epoch variance; ``robust``
+    uses a low quantile of epoch levels and median within-epoch variance.
 
-    Two statistic modes exist (see :data:`BAND_NORM_STATISTICS`):
-
-    * ``"ema"`` -- the original design: a streaming per-recording EMA of the mean
-      level and mean within-epoch variance, updated on every training forward.
-      Its mean level moves with the night's stage mix, so low-N3 or wake-heavy
-      cohorts are systematically mis-placed.
-    * ``"robust"`` -- a precomputed table (10th percentile of the per-epoch level,
-      root-median within-epoch variance) built once per run by the same reducer
-      inference uses (:func:`robust_recording_statistics`). Nothing is updated
-      in the forward pass, so augmented views, class-balanced samplers and
-      absent channels can no longer contaminate the statistics. The trainable
-      passband edges drift by well under 0.1 Hz over a run, which is why a
-      once-per-run table is accurate enough.
+    Without pinned statistics, recording indices select saved table rows. Cold
+    EMA rows blend from identity according to ``seen_count``; robust rows are
+    used only when populated. Missing indices, out-of-range indices, and disabled
+    normalization pass through unchanged. Forward calls do not update the tables.
 
     Args:
-        num_channels: Band channels ``C`` (EEG channels x sinc filters).
+        num_channels: Envelope feature channels ``C``.
         max_recordings: Rows in the statistics buffers. Indices at or above
             this are passed through unchanged rather than raising, so an
             unexpectedly large vocabulary degrades to identity instead of
             killing a run.
-        momentum: EMA weight for each update.
+        momentum: Saved EMA configuration retained for checkpoint compatibility.
         warmup_updates: Updates before a recording's statistics are trusted
             fully; below it the output blends from identity toward normalised.
         enabled: When False the module is an exact identity and never touches
             its buffers, so existing checkpoints reconstruct bit-for-bit.
+        eps: Floor for variance and scale calculations.
         statistic: ``"ema"`` (streaming, default for checkpoint compatibility)
             or ``"robust"`` (saved robust statistics).
     """
@@ -555,17 +524,13 @@ class PerRecordingBandNorm(nn.Module):
         )
 
 
-# ----------------------------------------------------------------- branches
-
-
 class EMGEnvelopeBranch(nn.Module):
     """Full-bandwidth short-kernel filters -> rectify -> low-pass -> log envelope.
 
-    Chin EMG carries its information in the *power* of a 10-100 Hz broadband
-    signal. The branch therefore keeps the first convolution at the input rate
-    with no anti-aliasing in front of it, demodulates explicitly, smooths the
-    magnitude with a fixed Kaiser low-pass (``lowpass_hz``), compresses with
-    ``log1p`` and only then decimates by 2 to the stem output rate.
+    The first convolution runs at the input rate. Its absolute magnitude is
+    smoothed with a fixed Kaiser low-pass (``lowpass_hz``), compressed with
+    ``log1p``, and decimated by two. The envelope is not squared power and cannot
+    recover frequencies above the input Nyquist limit.
 
     Output: ``[N, out_ch, ceil(T/2)]``.
     """
@@ -656,13 +621,11 @@ class EMGEnvelopeBranch(nn.Module):
 class EOGLowRateBranch(nn.Module):
     """Decimate first, then long-receptive-field convolutions at a low rate.
 
-    Slow eye movements (0.3-2 Hz) and REMs (1-5 Hz) need seconds of context,
-    not 128 Hz resolution. The branch Kaiser-decimates by ``decimation``
-    (default 8 -> 16 Hz), applies parallel dilated convolutions whose combined
-    receptive field spans several seconds, and resamples back to the stem
-    output rate (``decimation / 2``) with an anti-imaging up-sampler. Half of the
-    dilation-1 filters are initialised odd-symmetric so saw-tooth REM and ramp
-    SEM morphology have a dedicated edge-detecting direction from step 0.
+    The branch Kaiser-decimates by ``decimation``, applies parallel dilated
+    convolutions at ``fs / decimation``, then upsamples by ``decimation / 2``
+    with an anti-imaging filter to match the stem rate. Half of the dilation-one
+    filters are initialized odd-symmetric. Kernel lengths, dilation values, and
+    decimation are constructor settings.
 
     Output: ``[N, out_ch, ceil(T/2)]``.
     """
@@ -770,14 +733,12 @@ class EOGLowRateBranch(nn.Module):
 class EEGTwoScaleBranch(nn.Module):
     """Short-kernel multi-dilation stem ++ long-kernel sinc band-power path.
 
-    The short path is the unchanged :class:`FlexiblePhysiologicalStem` (70 ms
-    kernels, dilations up to 0.5 s): transients, K-complex edges, vertex waves.
-    The band path applies ``band_filters`` constrained sinc band-passes of
-    ``band_kernel`` taps (1 s at 128 Hz => ~2 Hz resolution) to every EEG
-    channel independently, rectifies, smooths (``band_lowpass_hz``), log
-    compresses and decimates by 2 -- a learnable band-power front end whose
-    passband edges are trainable but always valid. Both paths are concatenated
-    to ``out_ch``.
+    The short path uses :class:`FlexiblePhysiologicalStem`. The band path applies
+    ``band_filters`` constrained sinc filters with ``band_kernel`` taps to each
+    EEG channel independently, takes absolute magnitude, smooths at
+    ``band_lowpass_hz``, applies ``log1p``, and decimates by two. Band limits,
+    kernel lengths, and dilations are configurable. Both paths are concatenated
+    to ``out_ch``; the rectified envelope is not squared power.
 
     Output: ``[N, out_ch, ceil(T/2)]``.
     """
@@ -988,16 +949,12 @@ class EEGTwoScaleBranch(nn.Module):
         return torch.cat((short, band), dim=1)
 
 
-# --------------------------------------------------------------------- stem
-
-
 class MultiRateModalityStem(nn.Module):
-    """Route channels to the three multi-rate branches and fuse at 64 Hz.
+    """Route channels to modality branches and fuse at half the input rate.
 
-    Presence handling mirrors ``FlexibleModalityAwareStem``: absent channels are
-    zeroed, a branch runs only on the rows whose modality is present (so zero
-    placeholders never update its BatchNorm statistics), and a row with no
-    modality at all raises.
+    Absent channels are zeroed. A branch runs only on rows with that modality
+    present, so zero placeholders never update its BatchNorm statistics.
+    A row with no modality at all raises.
     """
 
     def __init__(
@@ -1314,17 +1271,20 @@ class MultiRateModalityStem(nn.Module):
         }
 
 
-# ------------------------------------------------------------------ encoder
-
-
 class MultiRateAsymmetricEpochCNN(nn.Module):
-    """Multi-rate per-modality stem + flexible trunk + attentive-statistics pool.
+    """Encode normalized epochs with modality branches, a trunk, and pooling.
+
+    Inputs are ``[N, in_ch, time_len]`` floating tensors; output is
+    ``[N, out_dim]`` on the input device. Model and input must share a device.
+    Saved constructor settings determine the architecture, including the
+    normalization modalities and filter constraints. Use ``get_config()`` for
+    the complete constructor configuration.
 
     Args:
         in_ch: Number of input channels.
         time_len: Samples per epoch (3840 at 128 Hz).
         widths: Five widths ``(stem, stage1, stage2, stage3, stage4)``; ``None``
-            selects the flexible defaults ``(64, 128, 192, 256, 256)``. Slot 4
+            selects ``_DEFAULT_WIDTHS``. Slot 4
             is the pre-pool width and, unless ``pool_out_dim`` is set, the
             encoder output width.
         dropout: Dropout in the stem fusion and trunk blocks.
@@ -1344,7 +1304,7 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             stem filters (cutoff relative to the post-decimation Nyquist).
         trunk_kernel_size / trunk_strides / trunk_dilations / trunk_fir_taps:
             The flexible trunk schedule. Total downsampling is ``2 * prod(strides)``.
-        pooling_mode: ``"attentive_stats"`` or ``"learned"`` (flexible's pool).
+        pooling_mode: ``"attentive_stats"`` or ``"learned"`` latent-query pooling.
         pool_out_dim: Pooled width; ``None`` keeps ``widths[4]``.
         pool_heads / pool_bottleneck / pool_occupancy: Attentive-stats options.
         pool_mfa: Aggregate stage-3 and stage-4 maps before pooling.
@@ -1629,8 +1589,6 @@ class MultiRateAsymmetricEpochCNN(nn.Module):
             )
         self.out_dim = out_dim
         self._temporal_dim = pre_pool
-
-    # ------------------------------------------------------------ interface
 
     @property
     def temporal_dim(self) -> int:

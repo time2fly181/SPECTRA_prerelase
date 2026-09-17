@@ -37,7 +37,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Stage names
 STAGE_NAMES_5 = ["W", "N1", "N2", "N3", "REM"]
 DEFAULT_5CH_NAMES = ["EEG1", "EEG2", "EOG1", "EOG2", "EMG"]
 
@@ -211,16 +210,21 @@ class InferenceModelLoadError(RuntimeError):
 
 @dataclass
 class ScoreOptions:
-    """Options for inference scoring.
+    """EDF scoring, batching, and Monte Carlo dropout options.
 
-    Default preprocessing matches the training pipeline's sampling rate:
-    - Resampling: 128 Hz
-    - Channel filtering is intentionally disabled (signals are assumed to have
-      been filtered during offline preprocessing).
+    Sampling rate and context half-width are fixed properties. EDF scoring
+    requires 30-second epochs and always applies external signal-valid median/IQR
+    normalization without a bandpass or notch filter. Defaults below belong to
+    the Python API; the CLI and GUI may supply different batch sizes.
+
+    The analysis interval is half-open on the original EDF epoch grid. Negative
+    starts are clamped to zero; ``end_epoch=-1`` selects the recording end.
+    Invalid exterior epochs can be trimmed without shifting exported indices.
+    ``calibration_mode`` and ``prenormalized`` are retained compatibility fields;
+    they do not alter this EDF preprocessing path.
     """
 
-    # Signal processing
-    epoch_sec: int = 30  # Epoch duration in seconds
+    epoch_sec: int = 30
 
     # Analysis window. Only this interval is normalized and run through the
     # model; full-length returned/saved arrays mark outside epochs unscored.
@@ -231,16 +235,12 @@ class ScoreOptions:
     # Inference
     amp_mode: str = "fp32"  # Mixed precision: fp16, bf16, fp32
     batch_size: int = 32
-    sequential_loading: bool = (
-        True  # Use sequential epoch loading (reduces memory by ~10-100x)
-    )
+    sequential_loading: bool = True  # Materialize one context batch at a time.
     cuda_prefetch: bool = True  # CUDA-only: overlap CPU→GPU transfer with computation
 
-    # Preprocessing calibration
-    calibration_mode: str = "per_recording"  # checkpoint, per_recording, warmup
-    prenormalized: bool = (
-        False  # If True, zarr files contain prenormalized data (skip calibration)
-    )
+    # Compatibility fields; external EDF normalization is always applied.
+    calibration_mode: str = "per_recording"
+    prenormalized: bool = False
 
     # Monte Carlo dropout
     use_mc_dropout: bool = False
@@ -261,18 +261,12 @@ class ScoreOptions:
     # Use r"^classifier\." to restrict sampling to a dropout-bearing classifier.
     mc_module_pattern: str | None = None
 
-    # Overlap-averaging (predict_all): when True, each epoch is scored by averaging
-    # the LOGITS produced for it across every overlapping context window (train/test
-    # parity with --predict_all eval) instead of using only the center prediction.
-    # Off by default, retaining center-only predictions.
+    # Pool valid per-position outputs from overlapping windows. Consistent MC
+    # probability pooling averages posteriors; other modes average logit values.
     overlap_average: bool = False
 
-    # Averaged (EMA/SWA) weights: when True, load ``ema.module`` from the
-    # checkpoint instead of the raw ``model`` weights. Training evaluates and
-    # selects checkpoints on the averaged weights whenever averaging is enabled
-    # (``best.ckpt.metrics.json`` records ``"weights": "ema"``), so scoring the
-    # raw weights measures a different model than the one validation ranked.
-    # Off by default to preserve historical numbers for existing checkpoints.
+    # Retained option field. The loader currently reads its explicit
+    # prefer_averaged keyword, not this field; see load_model_from_checkpoint.
     prefer_averaged: bool = False
 
     @property
@@ -331,9 +325,8 @@ def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
 def compute_flag_scores(probabilities: np.ndarray) -> dict[str, np.ndarray]:
     """Compute per-epoch uncertainty-flag scores from a posterior array.
 
-    These are the cheap-pass flag metrics for uncertainty-gated adaptive compute.
-    All three are derived directly from the softmax posterior with zero extra
-    forward passes.
+    All three metrics are derived from the softmax posterior without additional
+    model forwards. They support review ranking; they do not gate model execution.
 
     Args:
         probabilities: Posterior array of shape ``(n_epochs, n_classes)``.
@@ -708,19 +701,20 @@ def create_epoch_batches(
     epoch_sec: int,
     context_half: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create epoch batches with context windows.
+    """Materialize zero-padded context windows from one normalized recording.
 
     Args:
-        data: Preprocessed data (n_channels, n_samples)
-        presence_mask: Channel presence mask (n_channels,)
-        fs: Sampling frequency
-        epoch_sec: Epoch duration in seconds
-        context_half: Context window half-width
+        data: Dimensionless preprocessed samples ``[C, samples]`` in slot order.
+        presence_mask: Recording-level channel availability ``[C]``.
+        fs: Required sampling frequency, 128 Hz.
+        epoch_sec: Required epoch duration, 30 seconds.
+        context_half: Required half-width, ten epochs.
 
     Returns:
-        Tuple of (epoch_windows, presence_mask_tensor)
-        - epoch_windows: Tensor of shape (n_epochs, context_len, n_channels, samples_per_epoch)
-        - presence_mask_tensor: Tensor of shape (n_channels,)
+        Float32 CPU tensors ``(windows, presence)`` shaped ``[N, 21, C, 3840]``
+        and ``[C]``. ``N`` counts complete input epochs; trailing samples are
+        omitted. Index 10 targets each center epoch. Boundary padding is zero;
+        inference separately constructs boundary and per-channel validity masks.
     """
     if (fs, epoch_sec, context_half) != (128, 30, 10):
         raise ValueError(
@@ -730,7 +724,6 @@ def create_epoch_batches(
     samples_per_epoch = fs * epoch_sec
     n_epochs = n_samples // samples_per_epoch
 
-    # Truncate to complete epochs
     data = data[:, : n_epochs * samples_per_epoch]
 
     # Reshape to epochs: (n_channels, n_epochs, samples_per_epoch)
@@ -738,24 +731,19 @@ def create_epoch_batches(
     # Transpose to (n_epochs, n_channels, samples_per_epoch)
     data_epochs = data_epochs.transpose(1, 0, 2)
 
-    # Create context windows
     context_len = 2 * context_half + 1
     epoch_windows = []
 
     for i in range(n_epochs):
-        # Get context range
         start_idx = max(0, i - context_half)
         end_idx = min(n_epochs, i + context_half + 1)
 
-        # Extract window
         window = data_epochs[
             start_idx:end_idx
         ]  # (actual_len, n_channels, samples_per_epoch)
 
-        # Pad if needed
         actual_len = window.shape[0]
         if actual_len < context_len:
-            # Calculate how many epochs we're missing before and after
             missing_before = max(0, context_half - i)
             missing_after = max(0, (i + context_half + 1) - n_epochs)
 
@@ -770,7 +758,6 @@ def create_epoch_batches(
     # Stack to (n_epochs, context_len, n_channels, samples_per_epoch)
     epoch_windows = np.stack(epoch_windows, axis=0)
 
-    # Convert to tensors
     epoch_windows_tensor = torch.from_numpy(epoch_windows).float()
     presence_mask_tensor = torch.from_numpy(presence_mask).float()
 
@@ -832,25 +819,26 @@ def create_epoch_batch_generator(
     batch_size: int,
     epoch_channel_valid: np.ndarray | None = None,
 ):
-    """Generator that yields epoch batches sequentially to reduce memory usage.
+    """Yield context windows from one normalized recording, one batch at a time.
 
-    This generator creates context windows on-the-fly, processing only one batch
-    at a time. This dramatically reduces memory usage compared to pre-allocating
-    all epoch windows, especially beneficial for long recordings on systems with
-    limited RAM (like macOS).
+    Complete epochs are centered at index 10 with zero padding at recording
+    boundaries. Interior gaps stay in place; trailing incomplete samples are
+    omitted. The source recording remains in memory.
 
     Args:
-        data: Preprocessed data (n_channels, n_samples)
-        presence_mask: Channel presence mask (n_channels,)
-        fs: Sampling frequency
-        epoch_sec: Epoch duration in seconds
-        context_half: Context window half-width
-        batch_size: Number of epochs per batch
+        data: Dimensionless preprocessed samples ``[C, samples]`` in slot order.
+        presence_mask: Recording-level channel availability ``[C]``.
+        fs: Required sampling frequency, 128 Hz.
+        epoch_sec: Required epoch duration, 30 seconds.
+        context_half: Required half-width, ten epochs.
+        batch_size: Positive maximum number of center epochs per batch.
+        epoch_channel_valid: Optional boolean ``[N, C]`` channel-epoch validity.
 
     Yields:
-        Tuple of (batch_tensor, presence_mask_tensor) for each batch:
-        - batch_tensor: Tensor of shape (batch_size, context_len, n_channels, samples_per_epoch)
-        - presence_mask_tensor: Tensor of shape (n_channels,)
+        ``(wave, mask, batch_start, batch_end)`` with float32 CPU tensors and
+        half-open center-epoch bounds. Waveforms are ``[B, 21, C, 3840]`` with
+        ``B <= batch_size``. Masks are ``[C]`` without epoch validity, or
+        ``[B, 21, C]`` with it, including false boundary padding.
     """
     if (fs, epoch_sec, context_half) != (128, 30, 10):
         raise ValueError(
@@ -860,7 +848,6 @@ def create_epoch_batch_generator(
     samples_per_epoch = fs * epoch_sec
     n_epochs = n_samples // samples_per_epoch
 
-    # Truncate to complete epochs
     data = data[:, : n_epochs * samples_per_epoch]
 
     # Reshape to epochs: (n_channels, n_epochs, samples_per_epoch)
@@ -879,24 +866,19 @@ def create_epoch_batch_generator(
                 f"{(n_epochs, n_channels)}, got {resolved_validity.shape}"
             )
 
-    # Process epochs in batches
     for batch_start in range(0, n_epochs, batch_size):
         batch_end = min(batch_start + batch_size, n_epochs)
         batch_windows = []
         batch_masks: list[np.ndarray] = []
 
-        # Create context windows for this batch only
         for i in range(batch_start, batch_end):
-            # Get context range
             start_idx = max(0, i - context_half)
             end_idx = min(n_epochs, i + context_half + 1)
 
-            # Extract window
             window = data_epochs[
                 start_idx:end_idx
             ]  # (actual_len, n_channels, samples_per_epoch)
 
-            # Pad if needed
             actual_len = window.shape[0]
             missing_before = max(0, context_half - i)
             missing_after = max(0, (i + context_half + 1) - n_epochs)
@@ -918,7 +900,6 @@ def create_epoch_batch_generator(
                     )
                 batch_masks.append(mask_window)
 
-        # Stack this batch and convert to tensor
         batch_array = np.stack(batch_windows, axis=0)
         batch_tensor = torch.from_numpy(batch_array).float()
         batch_presence = (
@@ -1387,13 +1368,11 @@ def _verify_loaded_learnable_pe(
 def _infer_multirate_structure(state_dict: Mapping[str, Any]) -> dict[str, Any]:
     """Recover a ``multirate_asymmetric`` encoder's structure from weight shapes.
 
-    Used only when a checkpoint carries no ``model_config``. Everything returned
-    is unambiguous from a tensor shape (widths, branch widths and filter counts,
-    kernel sizes, pooling head geometry). Options that leave no trace in the
-    weights -- dilation *values*, stride schedule, decimation factor, low-pass
-    cutoffs, sinc kernel length -- fall back to the encoder defaults, which is
-    why ``extract_transformer_config`` persists the whole ``get_config()`` for
-    this variant.
+    The loader uses this to fill missing encoder settings, then overlays explicit
+    checkpoint encoder metadata. Tensor shapes identify widths, filter counts,
+    kernel sizes, and pooling geometry. Settings not encoded in those shapes
+    (such as dilation values, stride schedule, decimation, and low-pass cutoffs)
+    still require metadata or fall back to constructor defaults.
 
     Returns:
         Constructor kwargs plus a ``"widths"`` entry the caller routes to
@@ -1515,7 +1494,27 @@ def load_model_from_checkpoint(
     options: ScoreOptions | None = None,
     channel_names: list[str] | None = None,
 ) -> tuple[nn.Module, dict]:
-    """Reconstruct the supported CNN + transformer from saved inference metadata."""
+    """Reconstruct an evaluation-mode CNN/transformer from trusted checkpoint data.
+
+    Args:
+        checkpoint_path: Trusted PyTorch checkpoint; loading permits pickle objects.
+        device: Destination for the reconstructed model.
+        checkpoint_data: Optional already-loaded checkpoint mapping.
+        prefer_averaged: Select ``ema.module`` weights when present; otherwise
+            log the fallback to ordinary model weights.
+        options: Compatibility argument, currently unused. In particular, its
+            ``prefer_averaged`` field is not forwarded to the keyword above.
+        channel_names: Optional model-construction channel-name override.
+
+    Returns:
+        Model and checkpoint dictionary with resolved ``model_config`` and an
+        ``_inference_load_audit``. The model is moved to ``device`` and set to eval.
+
+    Raises:
+        InferenceModelLoadError: If architecture or learned weights are unsupported
+            or incompatible. Explicit multirate model metadata is required.
+        ValueError: If checkpoint geometry conflicts with fixed inference inputs.
+    """
     from spectra.models import TransformerContextNet
     from spectra.utils.checkpoint import (
         normalize_state_dict_keys,
@@ -2446,9 +2445,9 @@ def run_inference_sequential(
 ) -> np.ndarray:
     """Run batched inference with sequential epoch loading (memory-efficient).
 
-    This function uses a generator to create epoch batches on-the-fly, which
-    dramatically reduces memory usage compared to pre-allocating all epochs.
-    Recommended for long recordings or systems with limited RAM.
+    Context windows are materialized per batch while the normalized source
+    recording remains in memory. Whole-recording band statistics are pinned
+    automatically when required by the model, as in ``run_inference``.
 
     Args:
         model: Model to use for inference
@@ -2484,7 +2483,6 @@ def run_inference_sequential(
 
     model.eval()
 
-    # Calculate total epochs
     n_channels, n_samples = data.shape
     samples_per_epoch = fs * epoch_sec
     n_epochs = n_samples // samples_per_epoch
@@ -2592,7 +2590,13 @@ def run_inference_sequential(
 
 
 def postprocess_logits(logits: np.ndarray) -> dict[str, np.ndarray]:
-    """Convert logits to predictions, confidence, and uncertainty flags."""
+    """Convert ``[N, K]`` logits to probabilities, labels, and uncertainty flags.
+
+    Softmax probabilities and confidence are float32; argmax labels are int64.
+    ``raw_predictions`` and ``raw_probabilities`` alias their corresponding
+    outputs: no temporal smoothing or stage relabeling is applied. This helper
+    has no validity mask; ``score_recording`` marks invalid epochs afterward.
+    """
     logits = np.asarray(logits)
     if logits.ndim != 2:
         raise ValueError(
@@ -2720,19 +2724,24 @@ def pinned_recording_band_statistics(
 ) -> Iterator[None]:
     """Pin this recording's envelope statistics for the duration of the block.
 
-    Any caller that runs a model trained with ``--band_norm_per_recording``
-    outside :func:`infer_recording` must wrap the forward passes in this,
-    or the per-recording normalisation silently degrades to identity and the
-    encoder sees an envelope distribution it never trained on.
+    Public runtime scoring functions manage this context automatically. Custom
+    forward calls must use it when recording normalization is enabled; otherwise
+    absent recording indices leave envelopes unchanged. Previous pinned values
+    are restored on exit, including nested contexts and exceptions.
 
     Args:
         model: The unwrapped inference model.
         epoch_windows: ``[n_windows, context_len, channels, samples]`` for this
-            recording. A single-epoch recording may be passed as
-            ``[n_epochs, 1, channels, samples]``.
+            recording, with one center per epoch. Alternatively pass each epoch
+            once as ``[n_epochs, 1, channels, samples]`` to avoid context copies.
         device: Device to compute the statistics on.
         epoch_valid: Optional bool ``[n_windows]`` restricting the statistics
-            to signal-valid centre epochs, as :func:`infer_recording` does.
+            to usable center epochs.
+        presence_mask: Optional boolean ``[n_windows, channels]`` availability
+            for center epochs; missing modalities use neutral statistics.
+
+    Yields:
+        None. Statistics remain pinned while the context is active.
     """
     from spectra.model.band_norm_access import recording_norm_modules
 
@@ -2815,15 +2824,16 @@ def save_results(
         output_dir: Output directory
         edf_basename: Base name for output files
         stage_names: Stage name labels
-        artifact_stats: Optional artifact statistics dict
-        canonical_channels: Optional list of canonical channel names
+        artifact_stats: Compatibility argument; currently unused.
+        canonical_channels: Compatibility argument; currently unused.
         flag_scores: Optional per-epoch uncertainty arrays (e.g.
             ``flag_margin``/``flag_entropy``/``flag_maxprob`` and the MC-dropout
             ``mc_*`` arrays). When provided, they are written to a single
             ``{edf_basename}_flags.npz`` archive.
 
     Returns:
-        Dict of output file paths
+        Dict of CSV, NPY, and optional NPZ paths. Files with matching names are
+        overwritten. CSV indices start at zero and negative labels are Unscored.
     """
     # Ensure output_dir is valid (handle empty strings)
     if not output_dir or str(output_dir).strip() == "":
@@ -2831,7 +2841,6 @@ def save_results(
     resolved_output_dir = Path(output_dir)
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save predictions as CSV
     predictions_csv = resolved_output_dir / f"{edf_basename}_predictions.csv"
     with open(predictions_csv, "w") as f:
         f.write("Epoch,Stage\n")
@@ -2840,7 +2849,6 @@ def save_results(
             stage = "Unscored" if pred_int < 0 else stage_names[pred_int]
             f.write(f"{i},{stage}\n")
 
-    # Save probabilities as NPY
     probabilities_npy = resolved_output_dir / f"{edf_basename}_probabilities.npy"
     np.save(probabilities_npy, probabilities)
 
@@ -2874,21 +2882,35 @@ def score_recording(
     options: ScoreOptions | None = None,
     progress_callback: Callable[[str, int], None] | None = None,
 ) -> dict:
-    """Score a PSG recording from EDF file.
-
-    This is the main entry point for inference.
+    """Preprocess one EDF, score its analysis interval, and write prediction files.
 
     Args:
-        edf_path: Path to EDF file
-        checkpoint: Path to model checkpoint
-        canon_json: Optional path to canonical channels JSON
-        output_dir: Output directory for results
-        device: Device to use ("auto", "cuda", "mps", "cpu")
-        options: Scoring options (uses defaults if None)
-        progress_callback: Optional callback for progress updates
+        edf_path: EDF recording path.
+        checkpoint: Trusted compatible multirate CNN/transformer checkpoint.
+        canon_json: Optional path to a JSON list of five channel-slot requests.
+        output_dir: Destination directory; matching output names are overwritten.
+        device: Device preference (``auto``, ``cuda``, ``mps``, or ``cpu``).
+            Unavailable accelerators fall back with a warning.
+        options: Python scoring settings, or defaults when ``None``.
+        progress_callback: Optional ``callback(message, percent)`` for progress.
 
     Returns:
-        Dict with results and output paths
+        Dictionary on the original EDF epoch grid. ``predictions`` is int64
+        ``[N]`` in Wake/N1/N2/N3/REM order (0-4), with ``-1`` for invalid epochs.
+        ``probabilities`` is float32 ``[N, 5]``; invalid rows are zero.
+        ``epoch_signal_valid`` is bool ``[N, 5]`` and ``presence_mask`` is uint8
+        ``[5]``. Also includes confidence, uncertainty arrays, channel mapping,
+        ``n_epochs``, half-open ``score_window``, raw outputs, and paths.
+        Uncertainty and confidence are zero outside usable epochs.
+
+    Raises:
+        InferencePreprocessingError: If EDF preprocessing or channel alignment fails.
+        InferenceModelLoadError: If the checkpoint is unsupported or incompatible.
+
+    Notes:
+        Preprocessing and per-recording envelope statistics use the selected
+        interval. Scoring disables gradients; MC dropout does not set a seed.
+        Pinned statistics are restored and accelerator caches are released on exit.
     """
     if options is None:
         options = ScoreOptions()
@@ -2898,7 +2920,6 @@ def score_recording(
         if progress_callback:
             progress_callback(message, percent)
 
-    # Setup device
     resolved_device, device_warning, device_description = _resolve_inference_device(
         device
     )
@@ -2978,23 +2999,13 @@ def score_recording(
             analysis_epoch_signal_valid, options.context_half
         )
 
-    # Validate channel count matches model expectations
-    # NOTE: This validation checks the number of INPUT CHANNELS (e.g., EEG, EOG, EMG channels).
-    # Engineered sleep features do NOT affect this count - they are additional features
-    # concatenated in the feature dimension AFTER epoch encoding, not additional channels.
-    # This error indicates a mismatch between the canonical channel list used during
-    # training vs. inference.
     model_in_ch = _get_model_expected_channels(model)
 
-    logger.info(f"Model expects {model_in_ch} input channels")
-    if canonical_channels is not None:
-        logger.info(f"Canonical channels file has {len(canonical_channels)} channels")
-    else:
-        logger.info("No canonical channels file provided; using raw EDF channel order")
-    logger.info(f"Data tensor has {n_channels_in_data} channels")
+    logger.debug(
+        "Channel counts: model=%s, selected=%d", model_in_ch, n_channels_in_data
+    )
 
     if model_in_ch is not None and model_in_ch != n_channels_in_data:
-        # Try to get expected channels from checkpoint metadata
         expected_channels_hint = ""
         if "canonical_channels" in checkpoint_dict:
             expected_channels = checkpoint_dict["canonical_channels"]
@@ -3010,41 +3021,14 @@ def score_recording(
                 f"\n\nExpected channels from checkpoint metadata:\n{expected_channels}"
             )
 
-        if canonical_channels is not None:
-            raise InferencePreprocessingError(
-                f"Channel count mismatch detected:\n"
-                f"  - Model expects: {model_in_ch} input channels\n"
-                f"  - Canonical channels JSON provides: {len(canonical_channels)} channels\n"
-                f"  - Data tensor has: {n_channels_in_data} channels\n\n"
-                "Canonical channels from "
-                f"{Path(canon_json).name if canon_json is not None else 'runtime configuration'}:\n"
-                f"{canonical_channels}\n"
-                f"{expected_channels_hint}\n\n"
-                f"Possible causes:\n"
-                f"1. Different canonical_channels.json than used during training\n"
-                f"2. Model was trained with different number of channels\n"
-                f"3. Checkpoint file is from a different model configuration\n\n"
-                f"To fix: Use the canonical_channels.json that matches the model's training config"
-            )
         raise InferencePreprocessingError(
-            f"Channel count mismatch detected:\n"
-            f"  - Model expects: {model_in_ch} input channels\n"
-            f"  - Raw EDF channel order provides: {n_channels_in_data} channels\n\n"
-            f"Raw EDF channels:\n{inference_channel_names}\n"
-            f"{expected_channels_hint}\n\n"
-            f"Possible causes:\n"
-            f"1. The model was trained with a different channel count/order\n"
-            f"2. This recording needs a matching canonical_channels.json for alignment\n"
-            f"3. Checkpoint file is from a different model configuration"
+            f"Channel count mismatch: model expects {model_in_ch}, but selected "
+            f"EDF slots provide {n_channels_in_data}: {canonical_channels}. "
+            "Use a checkpoint and channel request with matching input slots."
+            f"{expected_channels_hint}"
         )
 
-    logger.info(
-        f"✓ Channel validation passed: {n_channels_in_data} channels match model expectations"
-    )
-
-    # Keep recording statistics available throughout scoring.
     recording_context = ExitStack()
-    # Use try/finally to ensure cleanup happens even if there's an error
     try:
         report_progress("Preparing recording statistics", 55)
 
@@ -3063,12 +3047,10 @@ def score_recording(
         )
         del support_wave, support_mask
 
-        # Run inference
         report_progress("Running inference", 65)
 
         diagnostics: dict[str, np.ndarray] = {}
         if options.sequential_loading:
-            # Use memory-efficient sequential inference
             logits = run_inference_sequential(
                 model,
                 preprocessed_data,
@@ -3083,7 +3065,6 @@ def score_recording(
                 diagnostics_out=diagnostics,
             )
         else:
-            # Use original batch inference
             if epoch_windows is None:
                 raise RuntimeError(
                     "epoch_windows must be materialized for batch inference"
@@ -3107,10 +3088,6 @@ def score_recording(
         raw_predictions = post.get("raw_predictions")
         confidences = post.get("confidences")
 
-        # Per-epoch uncertainty arrays computed by postprocessing (flag_* are
-        # always present). Collect the subset that exists so we can both persist
-        # and return them (additive, so existing callers that only read the base
-        # keys are unaffected).
         optional_arrays: dict[str, np.ndarray] = {
             k: post[k] for k in (*FLAG_SCORE_KEYS, *MC_SCORE_KEYS) if k in post
         }
@@ -3163,7 +3140,6 @@ def score_recording(
         for value in optional_arrays.values():
             value[invalid] = 0.0
 
-        # Save results
         report_progress("Saving results", 95)
         edf_basename = Path(edf_path).stem
         output_paths = save_results(
@@ -3210,8 +3186,6 @@ def score_recording(
             "presence_mask": prepared.presence_mask,
             "channel_mapping": prepared.channel_mapping,
             "output_paths": output_paths,
-            # Additive per-epoch uncertainty arrays (flag_* always, mc_* when MC
-            # dropout ran). Consumers that only read the base keys are unaffected.
             **optional_arrays,
         }
 
@@ -3219,60 +3193,16 @@ def score_recording(
 
     finally:
         recording_context.close()
-        # Critical: Clean up ALL memory to prevent crashes on subsequent runs
-        logger.info("Cleaning up model and memory...")
+        logger.debug("Releasing inference model and cached accelerator memory")
 
         import gc
 
-        # Explicitly delete heavy objects in order of importance
-        # Model and checkpoint data (largest memory consumers)
-        try:
-            del model
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del checkpoint_data
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del checkpoint_dict
-        except (NameError, UnboundLocalError):
-            pass
-
-        # Data tensors and arrays
-        try:
-            del epoch_windows
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del presence_mask_tensor
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del preprocessed_data
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del aligned_data
-        except (NameError, UnboundLocalError):
-            pass
-        try:
-            del channel_data
-        except (NameError, UnboundLocalError):
-            pass
-
-        # Local outputs are released when this function exits. Avoid referring
-        # to conditionally-created names here; that obscures static guarantees
-        # and does not materially improve cleanup inside a finally block.
-
-        # Force multiple garbage collection passes for thorough cleanup
-        gc.collect()
-        gc.collect()
+        # These locals are established before entering the scoring try block.
+        del model, checkpoint_data, checkpoint_dict
+        del epoch_windows, presence_mask_tensor, preprocessed_data
         gc.collect()
 
-        # Clear backend cache if using GPU. Use the resolved torch.device rather
-        # than the raw ``device`` preference string (which may be "auto"/"cuda"
-        # and has no ``.type`` attribute).
+        # Use the resolved backend; the original preference may be "auto".
         cleanup_device = resolved_device
         device_type = cleanup_device.type
 
@@ -3280,12 +3210,8 @@ def score_recording(
             try:
                 cleared = _cleanup_inference_device_memory(cleanup_device)
                 if cleared:
-                    logger.info(
-                        "✓ %s memory cache cleared successfully", device_type.upper()
-                    )
+                    logger.debug("%s memory cache cleared", device_type.upper())
             except Exception as e:
                 logger.warning(f"Failed to clear accelerator cache: {e}")
 
-        # Final garbage collection
         gc.collect()
-        logger.info("✓ Memory cleanup complete")
