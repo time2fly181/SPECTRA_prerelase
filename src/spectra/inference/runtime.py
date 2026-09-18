@@ -1022,30 +1022,8 @@ def _extract_checkpoint_d_model(
     return candidates[0][1]
 
 
-def _infer_context_mode_metadata(
-    state_dict: Mapping[str, Any],
-    keys: list[str],
-    key_map: Mapping[str, str],
-) -> dict[str, Any]:
-    """Recover relative-attention geometry, defaulting old states to legacy."""
-    encoder_bias_key = next(
-        (
-            key
-            for key in keys
-            if key.endswith("relative_position_bias")
-            and ("transformer.layers." in key or "enc_layers." in key)
-            and "center_context_readout." not in key
-        ),
-        None,
-    )
-    readout_bias_key = next(
-        (
-            key
-            for key in keys
-            if key.endswith("center_context_readout.relative_position_bias")
-        ),
-        None,
-    )
+def _reconcile_ffn_metadata(model_kwargs: dict[str, Any], keys: list[str]) -> None:
+    """Use checkpoint weights to recover the GELU or SwiGLU architecture."""
     swiglu_key = next(
         (
             key
@@ -1064,86 +1042,9 @@ def _infer_context_mode_metadata(
         ),
         None,
     )
-    metadata: dict[str, Any] = {
-        "context_attention_mode": (
-            "relative_full" if encoder_bias_key is not None else "legacy_absolute"
-        ),
-        "context_readout_mode": (
-            "relative_multihead" if readout_bias_key is not None else "legacy_single"
-        ),
-    }
-    if swiglu_key is not None:
-        metadata["ffn_activation"] = "swiglu"
-    elif gelu_key is not None:
-        metadata["ffn_activation"] = "gelu"
-    geometry_key = encoder_bias_key or readout_bias_key
-    if geometry_key is not None:
-        bias = state_dict[key_map[geometry_key]]
-        if isinstance(bias, torch.Tensor) and bias.ndim == 2:
-            lag_count = int(bias.shape[1])
-            if lag_count > 0 and lag_count % 2 == 1:
-                metadata["context_epochs"] = (lag_count + 1) // 2
-            metadata["nhead"] = int(bias.shape[0])
-    return metadata
-
-
-def _reconcile_context_mode_metadata(
-    model_kwargs: dict[str, Any],
-    inferred_context: Mapping[str, Any],
-) -> None:
-    """Make relative-attention state geometry authoritative during loading.
-
-    Relative attention and readout modes add learned parameters that cannot be
-    loaded into their legacy counterparts.  Some early checkpoints containing
-    those parameters carried missing or stale mode metadata, so the state-dict
-    signatures must win whenever either side says a relative mode is in use.
-    """
-    relative_modes = {
-        "context_attention_mode": "relative_full",
-        "context_readout_mode": "relative_multihead",
-    }
-    state_uses_relative = False
-
-    for key, relative_mode in relative_modes.items():
-        inferred_value = inferred_context[key]
-        configured_value = model_kwargs.get(key)
-        should_reconcile = (
-            inferred_value == relative_mode or configured_value == relative_mode
-        )
-        if should_reconcile:
-            state_uses_relative = state_uses_relative or inferred_value == relative_mode
-            if configured_value != inferred_value:
-                logger.warning(
-                    "Checkpoint %s mismatch: config=%r, state_dict=%r. "
-                    "Using state-dict architecture so learned parameters load.",
-                    key,
-                    configured_value,
-                    inferred_value,
-                )
-            model_kwargs[key] = inferred_value
-        else:
-            model_kwargs.setdefault(key, inferred_value)
-
-    # Relative-position tables encode both the trained head count and maximum
-    # context geometry.  Preserve those exact shapes even when config metadata
-    # is stale, otherwise attention behavior can differ despite a successful
-    # load of the ordinary projection weights.
-    for key in ("context_epochs", "nhead"):
-        inferred_value = inferred_context.get(key)
-        if not state_uses_relative or inferred_value is None:
-            continue
-        configured_value = model_kwargs.get(key)
-        if configured_value != inferred_value:
-            logger.warning(
-                "Checkpoint %s mismatch: config=%r, relative-bias state_dict=%r. "
-                "Using state-dict geometry.",
-                key,
-                configured_value,
-                inferred_value,
-            )
-        model_kwargs[key] = inferred_value
-
-    inferred_ffn = inferred_context.get("ffn_activation")
+    inferred_ffn = (
+        "swiglu" if swiglu_key is not None else "gelu" if gelu_key is not None else None
+    )
     if inferred_ffn is not None:
         configured_ffn = model_kwargs.get("ffn_activation")
         if configured_ffn is not None and configured_ffn != inferred_ffn:
@@ -1538,6 +1439,21 @@ def load_model_from_checkpoint(
             "SPECTRA supports only multirate_asymmetric CNN + TransformerContextNet "
             "checkpoints with explicit model_config metadata."
         )
+    supported_options = {
+        "context_attention_mode": "legacy_absolute",
+        "context_readout_mode": "legacy_single",
+        "classifier_head": "residual_mlp",
+        "head_norm": "layernorm",
+    }
+    for name, supported in supported_options.items():
+        if model_kwargs.get(name, supported) != supported:
+            raise InferenceModelLoadError(
+                f"Unsupported {name}={model_kwargs[name]!r}; only {supported!r} is supported"
+            )
+    if model_kwargs.pop("learnable_temperature", False):
+        raise InferenceModelLoadError(
+            "Learnable temperature checkpoints are unsupported"
+        )
     encoder_kwargs = dict(model_kwargs.get("multirate_asymmetric_encoder_kwargs") or {})
     if model_kwargs.get("recording_conditioning") or encoder_kwargs.get(
         "recording_conditioning"
@@ -1652,9 +1568,20 @@ def load_model_from_checkpoint(
         raise InferenceModelLoadError(
             "Checkpoint is missing the multirate asymmetric encoder"
         )
-    _reconcile_context_mode_metadata(
-        model_kwargs, _infer_context_mode_metadata(state_dict, keys, key_map)
-    )
+    removed_transformer_state = [
+        key
+        for key in keys
+        if key.endswith("relative_position_bias")
+        or key.startswith("center_context_readout.cross_attn.")
+        or key.startswith("classifier.norm.var_proj.")
+        or key in {"classifier.norm.var_gate", "log_temperature"}
+    ]
+    if removed_transformer_state:
+        raise InferenceModelLoadError(
+            "Checkpoint contains unsupported transformer state: "
+            f"{removed_transformer_state[:5]}"
+        )
+    _reconcile_ffn_metadata(model_kwargs, keys)
     if model_kwargs.get("recurrent_refinement_steps", 0) or any(
         key.startswith("recurrent_refiner.") for key in keys
     ):
@@ -1673,18 +1600,20 @@ def load_model_from_checkpoint(
         model_kwargs["use_per_position_head"] = True
         model_kwargs["classifier_head"] = "residual_mlp"
         model_kwargs["head_use_local_mix"] = "classifier.local.weight" in key_map
-        model_kwargs["head_norm"] = (
-            "layernorm" if "classifier.norm.bias" in key_map else "rmsnorm"
-        )
+        if "classifier.norm.bias" not in key_map:
+            raise InferenceModelLoadError(
+                "Per-position classifier requires LayerNorm state, including its bias"
+            )
         local = _get_tensor_from_clean_key(
             state_dict, key_map, "classifier.local.weight"
         )
         if local is not None:
             model_kwargs["head_local_kernel"] = int(local.shape[-1])
-    elif head_family in {"linear", "residual_mlp"}:
+    elif head_family == "linear":
+        raise InferenceModelLoadError("Linear classifier checkpoints are unsupported")
+    elif head_family == "residual_mlp":
         model_kwargs["classifier_head"] = head_family
         model_kwargs["use_per_position_head"] = False
-    model_kwargs["learnable_temperature"] = "log_temperature" in key_map
     model_kwargs["use_confidence_head"] = any(
         key.startswith("confidence_head.") for key in keys
     )

@@ -5,7 +5,7 @@ lower-rate EOG convolutions, and rectified EMG convolution envelopes. Fused
 features pass through a dilated trunk and configurable temporal pooling.
 Rectification here uses magnitude, not squared power. Constructor arguments and
 ``get_config()`` define the checkpoint's filter, stride, width, and pooling
-settings; the README describes the end-to-end inference data contract.
+settings.
 """
 
 from __future__ import annotations
@@ -146,8 +146,7 @@ def _as_reduction_input(x: torch.Tensor) -> torch.Tensor:
     """Move ``[N, C]`` per-epoch statistics to float64 on CPU.
 
     Reductions share one dtype and device. Inputs are detached, so recording
-    statistics do not carry gradients. This does not guarantee identical
-    upstream envelope values across devices or precision modes.
+    statistics do not carry gradients.
     """
     if x.ndim != 2:
         raise ValueError(f"expected [N, C] per-epoch statistics, got {tuple(x.shape)}")
@@ -252,10 +251,7 @@ class PerRecordingBandNorm(nn.Module):
 
     Args:
         num_channels: Envelope feature channels ``C``.
-        max_recordings: Rows in the statistics buffers. Indices at or above
-            this are passed through unchanged rather than raising, so an
-            unexpectedly large vocabulary degrades to identity instead of
-            killing a run.
+        max_recordings: Rows in the statistics buffers.
         momentum: Saved EMA configuration retained for checkpoint compatibility.
         warmup_updates: Updates before a recording's statistics are trusted
             fully; below it the output blends from identity toward normalised.
@@ -339,8 +335,7 @@ class PerRecordingBandNorm(nn.Module):
 
         Context inputs are ``[B, L, C, T]`` and reach the encoder as
         ``[B * L, C, T]``. Every window of one recording must carry that
-        recording's id; getting this wrong silently normalises epochs by another
-        recording's statistics.
+        recording's id
 
         Raises:
             ValueError: If ``recording_index`` does not have ``batch`` entries.
@@ -394,9 +389,7 @@ class PerRecordingBandNorm(nn.Module):
         order and persisted nowhere, so a row index is only meaningful together
         with the run that produced it. Saving the mapping lets a later stage
         (temporal pretraining, a resume after the split changed) look statistics
-        up by recording id instead of trusting that its own vocabulary happened
-        to enumerate recordings in the same order -- which would otherwise read
-        another recording's statistics silently.
+        up by recording id.
         """
         self._recording_ids = {str(k): int(v) for k, v in mapping.items()}
 
@@ -529,8 +522,7 @@ class EMGEnvelopeBranch(nn.Module):
 
     The first convolution runs at the input rate. Its absolute magnitude is
     smoothed with a fixed Kaiser low-pass (``lowpass_hz``), compressed with
-    ``log1p``, and decimated by two. The envelope is not squared power and cannot
-    recover frequencies above the input Nyquist limit.
+    ``log1p``, and decimated by two.
 
     Output: ``[N, out_ch, ceil(T/2)]``.
     """
@@ -914,13 +906,6 @@ class EEGTwoScaleBranch(nn.Module):
     @torch.no_grad()
     def sync_band_norm_reference(self) -> bool:
         """Point the per-recording norm at ``band_norm``'s training statistics.
-
-        Fine-tuning starts from an encoder whose ``band_norm`` running stats were
-        estimated on *un-normalised* envelopes. Mapping each recording onto those
-        same statistics makes the correction a smooth change rather than a scale
-        jump the trunk has never seen. Safe to call repeatedly; a no-op when the
-        band path or the per-recording norm is absent.
-
         Returns:
             True when a reference was copied.
         """

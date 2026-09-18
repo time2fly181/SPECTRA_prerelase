@@ -13,9 +13,7 @@ from .common import _make_norm1d
 class FlexiblePhysiologicalStem(nn.Module):
     """
     Flexible multi-dilation stem with sigmoid gating and global context.
-
-    Combines U-Sleep's uniform kernel approach with ASPP's multi-dilation strategy
-    and SE-style attention for learned scale selection. Designed for physiological
+    Designed for physiological
     signals where multiple timescales must be active simultaneously.
 
     Architecture:
@@ -32,21 +30,6 @@ class FlexiblePhysiologicalStem(nn.Module):
 
         Weighted Fusion → [B, out_ch, T]
         Anti-aliased Downsample 2x → [B, out_ch, T//2]
-
-    Key Features:
-    - Same kernel size across branches (simplifies hyperparameter tuning)
-    - Dilation-based multi-scale (not varying kernel sizes)
-    - Sigmoid gating allows multiple scales active simultaneously (not competitive)
-    - Global context via ASPP-style branch for slow/context cues
-    - SE-style attention for adaptive scale weighting
-    - Proper anti-aliasing with Kaiser filter
-
-    Timescale Examples (k=9, fs=128Hz):
-        d=1:  9 samples  = 70ms  (spindles, beta, fast transients)
-        d=2: 17 samples  = 133ms (alpha, theta)
-        d=4: 33 samples  = 258ms (K-complexes, slow theta)
-        d=8: 65 samples  = 508ms (delta, slow waves)
-        global: entire window (context)
 
     Args:
         in_ch: Input channels.

@@ -22,7 +22,6 @@ from .context_input import (
     WaveformInputs,
 )
 from .multirate_asymmetric_epoch_cnn import MultiRateAsymmetricEpochCNN
-from .normalization import VariancePreservingRMSNorm
 
 
 @dataclass
@@ -35,8 +34,7 @@ class ForwardOutput:
             Shape [B, d_model] or [B, L, d_model]. None if not requested.
         attention_weights: Attention weights from the last transformer layer.
             Shape [B, H, L, L]. None if not requested.
-        readout_attention_weights: Optional center-readout attention; its shape
-            depends on the checkpoint's readout implementation.
+        readout_attention_weights: Optional center-readout attention, shape [B, 1, 1, L].
         confidence: Predicted probability that the stage prediction is correct.
             Shape [B] or [B, L]. None if the confidence head is disabled.
     """
@@ -135,7 +133,7 @@ class PerPositionSleepHead(nn.Module):
             Default OFF: it can also smooth across true boundaries, so it must be
             ablated against off, not assumed beneficial.
         local_kernel: Kernel size for the depthwise mixing conv (odd).
-        norm: ``"layernorm"`` (default) or ``"rmsnorm"`` (variance-preserving).
+        norm: Must be ``"layernorm"``.
     """
 
     def __init__(
@@ -153,14 +151,9 @@ class PerPositionSleepHead(nn.Module):
         self.d_model = int(d_model)
         self.num_classes = int(num_classes)
         self.hidden_dim = int(hidden_dim or max(1, d_model // 2))
-        if norm == "rmsnorm":
-            self.norm: nn.Module = VariancePreservingRMSNorm(self.d_model)
-        elif norm == "layernorm":
-            self.norm = nn.LayerNorm(self.d_model)
-        else:
-            raise ValueError(
-                f"Unknown norm '{norm}' (expected 'layernorm' or 'rmsnorm')"
-            )
+        if norm != "layernorm":
+            raise ValueError("Only norm='layernorm' is supported")
+        self.norm = nn.LayerNorm(self.d_model)
         self.use_local_mix = bool(use_local_mix)
         if self.use_local_mix:
             if local_kernel % 2 == 0:
@@ -208,60 +201,6 @@ class PerPositionSleepHead(nn.Module):
             nn.init.zeros_(self.head.bias)
 
     def set_output_bias_from_log_priors(self, log_priors: torch.Tensor) -> None:
-        if self.head.bias is not None:
-            with torch.no_grad():
-                self.head.bias.copy_(log_priors.to(self.head.bias.device))
-
-
-CLASSIFIER_HEAD_CHOICES: tuple[str, ...] = ("residual_mlp", "linear")
-
-
-def validate_classifier_head_selection(
-    classifier_head: str, use_per_position_head: bool
-) -> None:
-    """Reject incompatible context-classifier selections."""
-    if classifier_head not in CLASSIFIER_HEAD_CHOICES:
-        raise ValueError(
-            f"classifier_head must be one of {CLASSIFIER_HEAD_CHOICES}, got {classifier_head!r}"
-        )
-    if classifier_head == "linear" and use_per_position_head:
-        raise ValueError(
-            "classifier_head='linear' and use_per_position_head=True both select the classification head, so they cannot be combined. The linear head is already position-agnostic and weight-shared (it applies the same LayerNorm+Linear at every epoch position), so use it on its own with --all_positions_loss. Choose classifier_head='residual_mlp' if you want the per-position MLP head instead."
-        )
-
-
-class LinearSleepHead(nn.Module):
-    """LayerNorm + linear readout, shared across context positions."""
-
-    def __init__(self, d_model: int, num_classes: int) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-        self.num_classes = int(num_classes)
-        self.norm = nn.LayerNorm(self.d_model)
-        self.head = nn.Linear(self.d_model, self.num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Map context features to logits.
-
-        Args:
-            x: ``[B, L, d]`` (all positions) or ``[B, d]`` (center only).
-
-        Returns:
-            ``[B, L, C]`` or ``[B, C]``, matching the input rank.
-        """
-        return self.head(self.norm(x))
-
-    def initialize_output_bias_uniform(self) -> None:
-        """Zero the output bias, giving a uniform prior over classes."""
-        if self.head.bias is not None:
-            nn.init.zeros_(self.head.bias)
-
-    def set_output_bias_from_log_priors(self, log_priors: torch.Tensor) -> None:
-        """Set the output bias to log class priors.
-
-        Args:
-            log_priors: ``[num_classes]`` tensor of log prior probabilities.
-        """
         if self.head.bias is not None:
             with torch.no_grad():
                 self.head.bias.copy_(log_priors.to(self.head.bias.device))
@@ -378,9 +317,7 @@ def _safe_key_padding_mask(
 class SwiGLUTransformerEncoderLayer(nn.Module):
     """Pre-norm encoder layer with a gated, bias-free SwiGLU FFN.
 
-    ``dim_feedforward`` is the gate/up hidden width directly. Consequently,
-    matching the parameter count of a two-projection GELU FFN requires a
-    SwiGLU width near two thirds of the GELU width.
+    ``dim_feedforward`` is the gate/up hidden width directly.
 
     Args:
         d_model: Token feature dimension.
@@ -488,258 +425,6 @@ def _encoder_layer_forward_with_attention(
     return (src, weights)
 
 
-def _encoder_layer_forward_explicit(
-    layer: nn.Module,
-    src: torch.Tensor,
-    *,
-    attn_mask: torch.Tensor | None,
-    key_padding_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Run an encoder layer without PyTorch's fused eval fast path.
-
-    PyTorch 2.9's fused transformer path produces NaNs when a three-dimensional
-    additive attention mask contains learned, nonzero relative-position biases.
-    Calling the constituent attention and feed-forward blocks explicitly keeps
-    the mask additive and preserves the ordinary TransformerEncoderLayer math.
-    """
-    typed_layer = cast(Any, layer)
-
-    def self_attention(x: torch.Tensor) -> torch.Tensor:
-        attn_out, _ = typed_layer.self_attn(
-            x,
-            x,
-            x,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-            is_causal=False,
-        )
-        return typed_layer.dropout1(attn_out)
-
-    if getattr(layer, "norm_first", True):
-        src = src + self_attention(typed_layer.norm1(src))
-        return src + _encoder_layer_feed_forward(layer, typed_layer.norm2(src))
-    src = typed_layer.norm1(src + self_attention(src))
-    return typed_layer.norm2(src + _encoder_layer_feed_forward(layer, src))
-
-
-class RelativePositionTransformerEncoderLayer(nn.TransformerEncoderLayer):
-    """Pre-norm encoder layer with signed relative bias and GELU or SwiGLU.
-
-    Args:
-        d_model: Token feature dimension.
-        nhead: Number of self-attention heads.
-        dim_feedforward: GELU hidden width or SwiGLU gate/up hidden width.
-        dropout: Attention, FFN, and residual dropout probability.
-        max_context_epochs: Maximum supported context-window length.
-        activation: Activation used by the checkpoint-compatible GELU path.
-        ffn_activation: Feed-forward architecture, ``gelu`` or ``swiglu``.
-        batch_first: Whether inputs use ``[batch, length, feature]`` layout.
-        norm_first: Whether to apply pre-norm Transformer residual blocks.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        *,
-        max_context_epochs: int = 21,
-        activation: Any = F.gelu,
-        ffn_activation: str = "gelu",
-        batch_first: bool = True,
-        norm_first: bool = True,
-    ) -> None:
-        if max_context_epochs < 1:
-            raise ValueError("max_context_epochs must be positive")
-        if ffn_activation not in {"gelu", "swiglu"}:
-            raise ValueError("ffn_activation must be 'gelu' or 'swiglu'")
-        super().__init__(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            batch_first=batch_first,
-            norm_first=norm_first,
-        )
-        self.ffn_activation = ffn_activation
-        if ffn_activation == "swiglu":
-            del self.linear1
-            del self.linear2
-            self.w_gate = nn.Linear(d_model, dim_feedforward, bias=False)
-            self.w_up = nn.Linear(d_model, dim_feedforward, bias=False)
-            self.w_down = nn.Linear(dim_feedforward, d_model, bias=False)
-            self.ffn_dropout = nn.Dropout(dropout)
-        self.nhead = int(nhead)
-        self.max_context_epochs = int(max_context_epochs)
-        self.relative_position_bias = nn.Parameter(
-            torch.zeros(nhead, 2 * max_context_epochs - 1)
-        )
-
-    def _relative_mask(
-        self,
-        src: torch.Tensor,
-        src_mask: torch.Tensor | None,
-        src_key_padding_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        batch, length, _ = src.shape
-        if length > self.max_context_epochs:
-            raise ValueError(
-                f"context length {length} exceeds configured maximum {self.max_context_epochs}"
-            )
-        positions = torch.arange(length, device=src.device)
-        signed_lag = positions[None, :] - positions[:, None]
-        indices = signed_lag + self.max_context_epochs - 1
-        bias = self.relative_position_bias[:, indices].to(dtype=src.dtype)
-        mask = bias.unsqueeze(0).expand(batch, -1, -1, -1).clone()
-        if src_mask is not None:
-            supplied = src_mask.to(device=src.device)
-            if supplied.dtype == torch.bool:
-                supplied_float = torch.zeros_like(supplied, dtype=src.dtype)
-                supplied_float.masked_fill_(supplied, float("-inf"))
-                supplied = supplied_float
-            else:
-                supplied = supplied.to(dtype=src.dtype)
-            if supplied.dim() == 2:
-                mask = mask + supplied[None, None, :, :]
-            elif supplied.dim() == 3 and supplied.size(0) == batch * self.nhead:
-                mask = mask + supplied.view(batch, self.nhead, length, length)
-            else:
-                raise ValueError(
-                    "src_mask must be [L,L] or [B*nhead,L,L] for relative attention"
-                )
-        safe_padding = _safe_key_padding_mask(src_key_padding_mask)
-        if safe_padding is not None:
-            mask.masked_fill_(safe_padding[:, None, None, :], float("-inf"))
-        return mask.reshape(batch * self.nhead, length, length)
-
-    def forward(
-        self,
-        src: torch.Tensor,
-        src_mask: torch.Tensor | None = None,
-        src_key_padding_mask: torch.Tensor | None = None,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        del is_causal
-        relative_mask = self._relative_mask(src, src_mask, src_key_padding_mask)
-        if self.ffn_activation == "swiglu" or not self.training:
-            return _encoder_layer_forward_explicit(
-                self, src, attn_mask=relative_mask, key_padding_mask=None
-            )
-        return super().forward(
-            src, src_mask=relative_mask, src_key_padding_mask=None, is_causal=False
-        )
-
-    def forward_with_attention(
-        self,
-        src: torch.Tensor,
-        *,
-        src_mask: torch.Tensor | None = None,
-        src_key_padding_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        relative_mask = self._relative_mask(src, src_mask, src_key_padding_mask)
-        return _encoder_layer_forward_with_attention(
-            self, src, attn_mask=relative_mask, key_padding_mask=None
-        )
-
-
-class RelativeMultiheadCenterReadout(nn.Module):
-    """Relative-aware multi-head center-to-neighbor attention readout."""
-
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        *,
-        max_context_epochs: int = 21,
-        dropout: float = 0.2,
-        gate_bias_init: float = -2.0,
-    ) -> None:
-        super().__init__()
-        if d_model % nhead:
-            raise ValueError("d_model must be divisible by nhead")
-        self.nhead = int(nhead)
-        self.max_context_epochs = int(max_context_epochs)
-        self.input_norm = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
-        self.relative_position_bias = nn.Parameter(
-            torch.zeros(nhead, 2 * max_context_epochs - 1)
-        )
-        self.fuse = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(approximate="tanh"),
-            nn.Dropout(dropout),
-        )
-        self.gate = nn.Linear(d_model * 2, d_model)
-        nn.init.constant_(self.gate.bias, gate_bias_init)
-        self._last_attention_weights: torch.Tensor | None = None
-
-    def forward(
-        self,
-        z: torch.Tensor,
-        epoch_valid_mask: torch.Tensor | None = None,
-        *,
-        return_attention: bool = False,
-    ) -> torch.Tensor:
-        if z.dim() != 3:
-            raise ValueError(f"Expected [B,L,D], got {tuple(z.shape)}")
-        batch, length, _ = z.shape
-        if length > self.max_context_epochs:
-            raise ValueError(
-                f"context length {length} exceeds configured maximum {self.max_context_epochs}"
-            )
-        center_idx = length // 2
-        center = z[:, center_idx, :]
-        valid = (
-            torch.ones(batch, length, dtype=torch.bool, device=z.device)
-            if epoch_valid_mask is None
-            else epoch_valid_mask.to(device=z.device, dtype=torch.bool)
-        )
-        if valid.shape != (batch, length):
-            raise ValueError(
-                f"epoch_valid_mask must have shape {(batch, length)}, got {tuple(valid.shape)}"
-            )
-        valid_neighbors = valid.clone()
-        valid_neighbors[:, center_idx] = False
-        has_neighbor = valid_neighbors.any(dim=1, keepdim=True)
-        center_fallback = torch.arange(length, device=z.device).eq(center_idx)
-        safe_valid = valid_neighbors | ~has_neighbor & center_fallback.unsqueeze(0)
-        key_positions = torch.arange(length, device=z.device)
-        lag_indices = key_positions - center_idx + self.max_context_epochs - 1
-        bias = self.relative_position_bias[:, lag_indices].to(dtype=z.dtype)
-        attn_mask = bias[None, :, None, :].expand(batch, -1, -1, -1).clone()
-        attn_mask.masked_fill_(~safe_valid[:, None, None, :], float("-inf"))
-        attn_mask = attn_mask.reshape(batch * self.nhead, 1, length)
-        normalized = self.input_norm(z)
-        context, weights = self.cross_attn(
-            normalized[:, center_idx : center_idx + 1, :],
-            normalized,
-            normalized,
-            attn_mask=attn_mask,
-            need_weights=return_attention,
-            average_attn_weights=False,
-        )
-        context = context.squeeze(1)
-        if return_attention:
-            if weights is None:
-                raise RuntimeError("Center readout did not return requested weights")
-            self._last_attention_weights = torch.where(
-                has_neighbor[:, None, :, None], weights, torch.zeros_like(weights)
-            )
-        else:
-            self._last_attention_weights = None
-        fused_input = torch.cat((center, context), dim=-1)
-        enriched = center + torch.sigmoid(self.gate(fused_input)) * self.fuse(
-            fused_input
-        )
-        return torch.where(has_neighbor, enriched, center)
-
-
 class TransformerContextNet(nn.Module):
     """Multirate asymmetric CNN and context transformer for normalized waveforms.
 
@@ -779,7 +464,6 @@ class TransformerContextNet(nn.Module):
         sdp_backend: str = "auto",
         fs: int = 128,
         classifier_temperature: float = 1.0,
-        learnable_temperature: bool = False,
         use_confidence_head: bool = False,
         confidence_head_weight: float = 0.1,
         confidence_head_detach_target: bool = True,
@@ -806,7 +490,6 @@ class TransformerContextNet(nn.Module):
         self.num_classes = num_classes
         self.epoch_encoder_variant = epoch_encoder_variant
         self.classifier_temperature = classifier_temperature
-        self.learnable_temperature = learnable_temperature
         self.use_confidence_head = bool(use_confidence_head)
         self.confidence_head_weight = float(confidence_head_weight)
         self.confidence_head_detach_target = bool(confidence_head_detach_target)
@@ -815,18 +498,16 @@ class TransformerContextNet(nn.Module):
         self.nhead = nhead
         self.context_epochs = int(context_epochs)
         clf_dropout = head_dropout if classifier_dropout is None else classifier_dropout
-        if context_attention_mode not in {"legacy_absolute", "relative_full"}:
+        if context_attention_mode != "legacy_absolute":
             raise ValueError(
-                "context_attention_mode must be 'legacy_absolute' or 'relative_full'"
+                "Only context_attention_mode='legacy_absolute' is supported"
             )
-        if context_readout_mode not in {
-            "legacy_single",
-            "relative_multihead",
-            "center_token",
-        }:
-            raise ValueError(
-                "context_readout_mode must be 'legacy_single', 'relative_multihead', or 'center_token'"
-            )
+        if context_readout_mode != "legacy_single":
+            raise ValueError("Only context_readout_mode='legacy_single' is supported")
+        if classifier_head != "residual_mlp":
+            raise ValueError("Only classifier_head='residual_mlp' is supported")
+        if head_norm != "layernorm":
+            raise ValueError("Only head_norm='layernorm' is supported")
         if context_epochs != 21:
             raise ValueError("SPECTRA requires context_half=10 (21 context epochs)")
         if fs != 128:
@@ -884,27 +565,12 @@ class TransformerContextNet(nn.Module):
         if enc_dim == d_model:
             nn.init.eye_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
-        if self.context_attention_mode == "legacy_absolute":
-            max_pe_len = 128
-            self.pos_encoding = nn.Parameter(torch.randn(1, max_pe_len, d_model) * 0.02)
-        else:
-            self.register_parameter("pos_encoding", None)
+        max_pe_len = 128
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_pe_len, d_model) * 0.02)
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1 for the transformer encoder")
         encoder_layer: nn.Module
-        if self.context_attention_mode == "relative_full":
-            encoder_layer = RelativePositionTransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_ff,
-                dropout=head_dropout,
-                batch_first=True,
-                norm_first=True,
-                activation=nn.GELU(approximate="tanh"),
-                ffn_activation=ffn_activation,
-                max_context_epochs=self.context_epochs,
-            )
-        elif ffn_activation == "swiglu":
+        if ffn_activation == "swiglu":
             encoder_layer = SwiGLUTransformerEncoderLayer(
                 d_model=d_model,
                 nhead=nhead,
@@ -928,25 +594,13 @@ class TransformerContextNet(nn.Module):
         )
         self.transformer.apply(transformer_init_)
         self.output_norm = nn.LayerNorm(d_model)
-        if self.context_readout_mode == "relative_multihead":
-            self.center_context_readout = RelativeMultiheadCenterReadout(
-                d_model=d_model,
-                nhead=nhead,
-                max_context_epochs=self.context_epochs,
-                dropout=clf_dropout,
-                gate_bias_init=self.fusion_gate_bias,
-            )
-        elif self.context_readout_mode == "legacy_single":
-            self.center_context_readout = CenterContextReadout(
-                d_model=d_model,
-                dropout=clf_dropout,
-                gate_bias_init=self.fusion_gate_bias,
-            )
-        else:
-            self.center_context_readout = nn.Identity()
+        self.center_context_readout = CenterContextReadout(
+            d_model=d_model,
+            dropout=clf_dropout,
+            gate_bias_init=self.fusion_gate_bias,
+        )
         self.center_context_readout.apply(transformer_init_)
         self.feature_dim = d_model
-        validate_classifier_head_selection(classifier_head, use_per_position_head)
         self.use_per_position_head = bool(use_per_position_head)
         self.classifier_head = str(classifier_head)
         if use_per_position_head:
@@ -959,8 +613,6 @@ class TransformerContextNet(nn.Module):
                 local_kernel=head_local_kernel,
                 norm=head_norm,
             )
-        elif classifier_head == "linear":
-            self.classifier = LinearSleepHead(d_model=d_model, num_classes=num_classes)
         else:
             self.classifier = ResidualMLPClassifier(
                 d_model=d_model,
@@ -976,21 +628,6 @@ class TransformerContextNet(nn.Module):
             )
         else:
             self.confidence_head = None
-        if learnable_temperature:
-            if classifier_temperature <= 0:
-                raise ValueError(
-                    f"classifier_temperature must be positive, got {classifier_temperature}"
-                )
-            init_val = (
-                math.log(classifier_temperature)
-                if classifier_temperature != 1.0
-                else 0.0
-            )
-            self.log_temperature = nn.Parameter(
-                torch.full((num_classes,), init_val, dtype=torch.float32)
-            )
-        else:
-            self.log_temperature = None
         self._last_features: torch.Tensor | None = None
         self._last_confidence_logits: torch.Tensor | None = None
         self._last_confidence: torch.Tensor | None = None
@@ -1013,8 +650,6 @@ class TransformerContextNet(nn.Module):
     ):
         """Fill compatible legacy state and discard removed positional parameters."""
         state_dict.pop(f"{prefix}pos_scale", None)
-        if self.pos_encoding is None:
-            state_dict.pop(f"{prefix}pos_encoding", None)
         if isinstance(self.output_norm, nn.LayerNorm):
             weight_key = f"{prefix}output_norm.weight"
             bias_key = f"{prefix}output_norm.bias"
@@ -1054,7 +689,7 @@ class TransformerContextNet(nn.Module):
         """Initialize classifier output layer bias to uniform prior (all classes equally likely)."""
         if isinstance(
             self.classifier,
-            (ResidualMLPClassifier, PerPositionSleepHead, LinearSleepHead),
+            (ResidualMLPClassifier, PerPositionSleepHead),
         ):
             self.classifier.initialize_output_bias_uniform()
         elif isinstance(self.classifier, nn.Sequential):
@@ -1064,14 +699,9 @@ class TransformerContextNet(nn.Module):
 
     def _init_readout_gate_bias(self) -> None:
         """Preserve the trained center-readout gate initialization."""
-        if isinstance(
-            self.center_context_readout,
-            (CenterContextReadout, RelativeMultiheadCenterReadout),
-        ):
-            gate = self.center_context_readout.gate
-            linear = gate[0] if isinstance(gate, nn.Sequential) else gate
-            if isinstance(linear, nn.Linear) and linear.bias is not None:
-                nn.init.constant_(linear.bias, self.fusion_gate_bias)
+        gate = self.center_context_readout.gate
+        if gate.bias is not None:
+            nn.init.constant_(gate.bias, self.fusion_gate_bias)
 
     @property
     def enc_layers(self) -> nn.ModuleList:
@@ -1080,7 +710,7 @@ class TransformerContextNet(nn.Module):
         return self.transformer.layers
 
     def _apply_scaled_position_encoding(self, z: torch.Tensor) -> torch.Tensor:
-        """Add legacy absolute positions or leave relative-attention inputs unchanged.
+        """Add legacy absolute positional encodings.
 
         Args:
             z: Input tensor of shape ``[B, L, D]``.
@@ -1088,11 +718,7 @@ class TransformerContextNet(nn.Module):
         Returns:
             Tensor of shape ``[B, L, D]`` with positional encoding added.
         """
-        if self.context_attention_mode == "relative_full":
-            return z
         L = z.size(1)
-        if self.pos_encoding is None:
-            raise RuntimeError("Legacy positional encoding is unavailable")
         if L > self.pos_encoding.size(1):
             raise ValueError(
                 f"context length {L} exceeds positional table length {self.pos_encoding.size(1)}"
@@ -1106,13 +732,7 @@ class TransformerContextNet(nn.Module):
         *,
         return_attention: bool = False,
     ) -> torch.Tensor:
-        if isinstance(self.center_context_readout, nn.Identity):
-            return z[:, z.size(1) // 2, :]
-        readout = cast(
-            CenterContextReadout | RelativeMultiheadCenterReadout,
-            self.center_context_readout,
-        )
-        return readout(
+        return self.center_context_readout(
             z, epoch_valid_mask=epoch_valid_mask, return_attention=return_attention
         )
 
@@ -1139,17 +759,12 @@ class TransformerContextNet(nn.Module):
             for idx, layer in enumerate(transformer.layers):
                 is_last = idx == len(transformer.layers) - 1
                 if is_last:
-                    if isinstance(layer, RelativePositionTransformerEncoderLayer):
-                        z, attention_weights = layer.forward_with_attention(
-                            z, src_mask=attn_mask, src_key_padding_mask=key_padding_mask
-                        )
-                    else:
-                        z, attention_weights = _encoder_layer_forward_with_attention(
-                            cast(nn.TransformerEncoderLayer, layer),
-                            z,
-                            attn_mask=attn_mask,
-                            key_padding_mask=key_padding_mask,
-                        )
+                    z, attention_weights = _encoder_layer_forward_with_attention(
+                        layer,
+                        z,
+                        attn_mask=attn_mask,
+                        key_padding_mask=key_padding_mask,
+                    )
                 else:
                     z = layer(
                         z, src_mask=attn_mask, src_key_padding_mask=key_padding_mask
@@ -1185,14 +800,7 @@ class TransformerContextNet(nn.Module):
         return (logits, confidence)
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        """Apply the configured learnable or fixed classifier temperature."""
-        if self.log_temperature is not None:
-            min_log_temp = math.log(0.1)
-            max_log_temp = math.log(10.0)
-            log_temp = torch.nan_to_num(
-                self.log_temperature, nan=0.0, posinf=max_log_temp, neginf=min_log_temp
-            ).clamp(min=min_log_temp, max=max_log_temp)
-            return logits / log_temp.exp()
+        """Apply the configured fixed classifier temperature."""
         if self.classifier_temperature != 1.0:
             return logits / self.classifier_temperature
         return logits
@@ -1305,7 +913,7 @@ class TransformerContextNet(nn.Module):
                 center = feats
             classifier_input = center
             center_feat = center
-        if isinstance(self.classifier, (ResidualMLPClassifier, LinearSleepHead)):
+        if isinstance(self.classifier, ResidualMLPClassifier):
             logits, confidence = self._compute_standard_head_outputs(classifier_input)
         else:
             logits = self.classifier(classifier_input)
